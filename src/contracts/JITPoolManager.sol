@@ -119,7 +119,7 @@ abstract contract JITPoolManager is ProtocolFees, Extsload, Exttload, IJITPoolMa
      */
     constructor(address initialOwner, address _poolManager, address _WETH, address _aavePool)
         ProtocolFees(initialOwner)
-        SafeCallback(_poolManager)
+        SafeCallback(IPoolManager(_poolManager))
     {
         WETH = IWETH9(_WETH);
         aavePool = IPool(_aavePool);
@@ -760,6 +760,10 @@ abstract contract JITPoolManager is ProtocolFees, Extsload, Exttload, IJITPoolMa
 
     function _repayWithATokens(address asset, uint256 amount, bool max) internal returns (uint256) {
         return aavePool.repayWithATokens(asset, max ? type(uint256).max : amount, 2);
+    }
+
+    function _isUnlocked() internal override returns (bool) {
+        return false;
     }
 
     /**

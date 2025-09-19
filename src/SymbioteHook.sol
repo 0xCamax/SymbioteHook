@@ -75,4 +75,5 @@ contract SymbioteHook is BaseHook, JITPoolManager {
 
         return (this.afterSwap.selector, 0);
     }
+
 }
