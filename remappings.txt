@@ -2,3 +2,6 @@
 @uniswap/v4-core/=lib/v4-periphery/lib/v4-core/
 @uniswap/v4-periphery/=lib/v4-periphery/
 @oz/=lib/openzeppelin-contracts/
+@aave/=lib/aave-v3-origin/
+@permit/=lib/v4-periphery/lib/permit2/src/
+@uniswap/universal-router/=lib/universal-router

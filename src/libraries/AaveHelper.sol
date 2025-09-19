@@ -1,8 +1,233 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-library Aave {
-    function deposit() internal {}
+import {IPool} from "@aave/src/contracts/interfaces/IPool.sol";
+import {ICreditDelegationToken} from "@aave/src/contracts/interfaces/ICreditDelegationToken.sol";
+import {IAToken} from "@aave/src/contracts/interfaces/IAToken.sol";
+import {IERC20} from "@oz/contracts/token/ERC20/IERC20.sol";
+import {IVariableDebtToken} from "@aave/src/contracts/interfaces/IVariableDebtToken.sol";
+import {DataTypes} from "@aave/src/contracts/protocol/libraries/types/DataTypes.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 
-    function withdraw() internal {}
+struct ModifyLiquidityAave {
+    address user;
+    address asset0;
+    address asset1;
+    BalanceDelta delta;
+}
+
+struct SwapParamsAave {
+    address asset0;
+    address asset1;
+    BalanceDelta delta;
+}
+
+struct AssetData {
+    address aTokenAddress;
+    address variableDebtTokenAddress;
+    uint128 liquidityIndex;
+    uint128 variableBorrowIndex;
+    uint128 currentLiquidityRate;
+    uint128 currentVariableBorrowRate;
+    uint40 lastUpdateTimestamp;
+}
+
+struct PoolMetrics {
+    uint256 totalCollateralETH;
+    uint256 totalDebtETH;
+    uint256 availableBorrowsETH;
+    uint256 currentLiquidationThreshold;
+    uint256 ltv;
+    uint256 healthFactor;
+}
+
+library AaveHelper {
+    using AaveHelper for IPool;
+
+    function init(IPool pool, address asset0, address asset1) internal returns (bool ok0, bool ok1) {
+        try pool.setUserUseReserveAsCollateral(asset0, true) {
+            ok0 = true;
+        } catch {
+            ok0 = false;
+        }
+        try pool.setUserUseReserveAsCollateral(asset1, true) {
+            ok1 = true;
+        } catch {
+            ok1 = false;
+        }
+    }
+
+    function modifyLiquidity(IPool pool, ModifyLiquidityAave memory params) internal {
+        int128 amount0 = params.delta.amount0();
+        int128 amount1 = params.delta.amount1();
+        if (amount0 < 0) {
+            IERC20(params.asset0).approve(address(pool), uint128(-amount0));
+            pool.supply(params.asset0, uint128(-amount0), address(this), 0);
+        }
+        if (amount1 < 0) {
+            IERC20(params.asset1).approve(address(pool), uint128(-amount1));
+            pool.supply(params.asset1, uint128(-amount1), address(this), 0);
+        }
+        if (amount0 > 0) {
+            pool.withdraw(params.asset0, uint128(amount0), params.user);
+        }
+        if (amount1 > 0) {
+            pool.withdraw(params.asset1, uint128(amount1), params.user);
+        }
+    }
+
+    function swap(IPool pool, SwapParamsAave memory params) internal {
+        int128 amount0 = params.delta.amount0();
+        int128 amount1 = params.delta.amount1();
+        require(amount0 > 0 || amount1 > 0);
+        if (amount0 > amount1) {
+            IERC20(params.asset0).approve(address(pool), uint128(amount0));
+            pool.supply(params.asset0, uint128(amount0), address(this), 0);
+            pool.withdraw(params.asset1, uint128(-amount1), address(this));
+        } else {
+            IERC20(params.asset1).approve(address(pool), uint128(amount1));
+            pool.supply(params.asset1, uint128(amount1), address(this), 0);
+            pool.withdraw(params.asset0, uint128(-amount0), address(this));
+        }
+    }
+
+    function maxBorrow(IPool pool, address asset, uint256 amount) internal view returns (uint256) {
+        uint256 ltv = pool.getAssetReserveData(asset).configuration.data & 0xFFFF;
+        return (amount * ltv) / 10000;
+    }
+
+    function safeLeverage(IPool pool, address asset) internal view returns (uint256 leverage) {
+        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(asset);
+        uint256 liquidationThreshold = (reserve.configuration.data >> 16) & 0xFFFF;
+        require(liquidationThreshold > 0 && liquidationThreshold < 10000, "Invalid LT");
+
+        uint256 ltWad = (liquidationThreshold * 1e18) / 10000;
+        leverage = 1e36 / (1e18 - ltWad); // 1 / (1 - LT)
+    }
+
+    function getAssetReserveData(IPool pool, address asset)
+        internal
+        view
+        returns (DataTypes.ReserveDataLegacy memory)
+    {
+        return pool.getReserveData(asset);
+    }
+
+    /**
+     * @dev Get comprehensive asset data from Aave
+     */
+    function getAssetData(IPool pool, address asset) internal view returns (AssetData memory data) {
+        DataTypes.ReserveDataLegacy memory d = pool.getReserveData(asset);
+        data.liquidityIndex = d.liquidityIndex;
+        data.variableBorrowIndex = d.variableBorrowIndex;
+        data.currentLiquidityRate = d.currentLiquidityRate;
+        data.currentVariableBorrowRate = d.currentVariableBorrowRate;
+        data.lastUpdateTimestamp = d.lastUpdateTimestamp;
+        data.aTokenAddress = pool.getReserveAToken(asset);
+        data.variableDebtTokenAddress = pool.getReserveVariableDebtToken(asset);
+    }
+
+    /**
+     * @dev Get pool's current metrics from Aave
+     */
+    function getPoolMetrics(IPool pool) internal view returns (PoolMetrics memory metrics) {
+        (
+            metrics.totalCollateralETH,
+            metrics.totalDebtETH,
+            metrics.availableBorrowsETH,
+            metrics.currentLiquidationThreshold,
+            metrics.ltv,
+            metrics.healthFactor
+        ) = pool.getUserAccountData(address(this));
+    }
+
+    /**
+     * @dev Calculate yield earned since last update using Aave indices
+     */
+    function calculateYieldSinceLastUpdate(
+        IPool pool,
+        address asset,
+        uint256 lastLiquidityIndex,
+        uint256 principalAmount
+    ) internal view returns (uint256 yieldEarned, uint256 currentIndex) {
+        AssetData memory data = getAssetData(pool, asset);
+        currentIndex = data.liquidityIndex;
+
+        if (lastLiquidityIndex > 0 && currentIndex > lastLiquidityIndex) {
+            // Calculate yield using Aave's compound interest formula
+            uint256 indexGrowth = currentIndex - lastLiquidityIndex;
+            yieldEarned = (principalAmount * indexGrowth) / 1e27; // RAY precision
+        }
+    }
+
+    /**
+     * @dev Calculate interest accrued on borrowed amount
+     */
+    function calculateInterestSinceLastUpdate(
+        IPool pool,
+        address asset,
+        uint256 lastBorrowIndex,
+        uint256 borrowedAmount
+    ) internal view returns (uint256 interestAccrued, uint256 currentIndex) {
+        AssetData memory data = getAssetData(pool, asset);
+        currentIndex = data.variableBorrowIndex;
+
+        if (lastBorrowIndex > 0 && currentIndex > lastBorrowIndex) {
+            uint256 indexGrowth = currentIndex - lastBorrowIndex;
+            interestAccrued = (borrowedAmount * indexGrowth) / 1e27; // RAY precision
+        }
+    }
+
+    /**
+     * @dev Get current aToken balance for an asset
+     */
+    function getATokenBalance(IPool pool, address asset, address user) internal view returns (uint256 balance) {
+        AssetData memory data = getAssetData(pool, asset);
+        if (data.aTokenAddress != address(0)) {
+            balance = IAToken(data.aTokenAddress).balanceOf(user);
+        }
+    }
+
+    /**
+     * @dev Get current variable debt balance for an asset
+     */
+    function getVariableDebtBalance(IPool pool, address asset, address user) internal view returns (uint256 balance) {
+        AssetData memory data = getAssetData(pool, asset);
+        if (data.variableDebtTokenAddress != address(0)) {
+            balance = IERC20(data.variableDebtTokenAddress).balanceOf(user);
+        }
+    }
+
+    /**
+     * @dev Calculate maximum safe borrowing amount to maintain health factor
+     */
+    function calculateMaxSafeBorrow(
+        IPool pool,
+        uint256 minHealthFactor // e.g., 1.5e18 for 150%
+    ) internal view returns (uint256 maxBorrowETH) {
+        PoolMetrics memory metrics = getPoolMetrics(pool);
+
+        if (metrics.healthFactor > minHealthFactor) {
+            // Calculate additional borrowing capacity while maintaining min health factor
+            uint256 maxDebtForHealthFactor =
+                (metrics.totalCollateralETH * metrics.currentLiquidationThreshold) / minHealthFactor / 100;
+
+            if (maxDebtForHealthFactor > metrics.totalDebtETH) {
+                maxBorrowETH = maxDebtForHealthFactor - metrics.totalDebtETH;
+
+                // Also consider available liquidity
+                if (maxBorrowETH > metrics.availableBorrowsETH) {
+                    maxBorrowETH = metrics.availableBorrowsETH;
+                }
+            }
+        }
+    }
+
+    /**
+     * @dev Check if asset can be used as collateral
+     */
+    function canUseAsCollateral(IPool pool, address asset) internal view returns (bool) {
+        AssetData memory data = getAssetData(pool, asset);
+        return data.aTokenAddress != address(0) && data.currentLiquidityRate > 0;
+    }
 }

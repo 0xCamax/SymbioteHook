@@ -1,204 +1,606 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.13;
 
-import {Test, console} from "forge-std/Test.sol";
-import {PositionManager} from "../src/contracts/PositionManager.sol";
-import {CalldataLibrary} from "../src/libraries/CalldataLibrary.sol";
-import {ModifyLiquidityParams, PoolKey} from "../src/interfaces/IPositionManager.sol";
-import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
-import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {Test, console2} from "forge-std/Test.sol";
+import {stdError} from "forge-std/StdError.sol";
 
-contract MainTests is Test {
-    PositionManager public posm;
+// Import your contracts (adjust paths as needed)
+import "../src/SymbioteHook.sol";
+import {ModifyLiquidityWindow} from "../src/contracts/JITPoolManager.sol";
+import {LiquidityAmounts} from "../src/libraries/LiquidityAmounts.sol";
 
-    using CalldataLibrary for bytes;
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {HookMiner} from "@uniswap/v4-periphery/src/utils/HookMiner.sol";
+import {AbritrumConstants} from "../src/contracts/Constants.sol";
+import {HookDeployer} from "../src/contracts/HookDeployer.sol";
+
+import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
+import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
+import {Commands} from "../src/libraries/Commands.sol";
+
+/**
+ * @title SymbioteHookTests
+ * @notice Comprehensive test suite for the cXc Hook implementation
+ * @dev Tests cover deployment, initialization, liquidity management, and swap functionality
+ */
+contract SymbioteHookTests is Test, AbritrumConstants {
+    using StateLibrary for IPoolManager;
+    using TickMath for int24;
+
+    /*//////////////////////////////////////////////////////////////
+                                CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    // Well-funded account on Arbitrum for testing
+    address public constant WHALE = 0x0a8494F70031623C9C0043aff4D40f334b458b11;
+
+    // Test liquidity amount
+    int128 private constant LIQUIDITY_TO_ADD = 10_000_000_000_000_000;
+
+    // Default fee for testing (0.3%)
+    uint24 private constant DEFAULT_FEE = 3000;
+
+    // Tick spacing for the test pool
+    int24 private constant TICK_SPACING = 50;
+
+    // Default swap amount
+    uint128 private constant SWAP_AMOUNT = 1_000_000_000;
+
+    /*//////////////////////////////////////////////////////////////
+                            STATE VARIABLES
+    //////////////////////////////////////////////////////////////*/
+
+    SymbioteHook public hook;
+    PoolKey public poolKey;
+    PoolKey public basePoolKey;
+    PoolId public poolId;
+
+    address public testAccount;
+
+    /*//////////////////////////////////////////////////////////////
+                                EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event PoolInitialized(PoolId indexed poolId, uint160 sqrtPrice);
+    event LiquidityAdded(bytes32 indexed positionId, int128 liquidity);
+    event LiquidityRemoved(bytes32 indexed positionId, int128 liquidity);
+
+    /*//////////////////////////////////////////////////////////////
+                               MODIFIERS
+    //////////////////////////////////////////////////////////////*/
+
+    modifier validPool() {
+        vm.assume(Currency.unwrap(poolKey.currency0) != Currency.unwrap(poolKey.currency1));
+        vm.assume(poolKey.fee > 0);
+        vm.assume(address(poolKey.hooks) != address(0));
+        _;
+    }
+
+    modifier poolInitialized() {
+        _initializePool();
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               SETUP
+    //////////////////////////////////////////////////////////////*/
 
     function setUp() public {
         // Create Arbitrum mainnet fork
         vm.createSelectFork("arbitrum");
 
-        // Deploy position manager with mock pool manager
-        posm = new PositionManager(address(0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32));
+        testAccount = address(this);
+
+        // Fund the test account with ETH
+        vm.deal(testAccount, 1000 ether);
+
+        // Transfer USDC from whale using safe approach
+        vm.startPrank(WHALE);
+        uint256 usdcAmount = 10_000_000 * 1e6;
+        require(USDC.balanceOf(WHALE) >= usdcAmount, "Whale has insufficient USDC");
+        USDC.transfer(testAccount, usdcAmount);
+        vm.stopPrank();
+
+        // Deploy hook with proper flag validation
+        _deployHook();
+
+        // Configure pool keys
+        _configurePoolKeys();
+
+        // Set up approvals
+        _setupApprovals();
+
+        // Validate initial state
+        _validateSetup();
     }
 
-    function test_CalldataLibrary_GetSelector() public view {
-        // Test the selector extraction
-        bytes memory testData = abi.encodeWithSelector(
-            posm.modifyLiquidity.selector,
-            PoolKey({
-                currency0: Currency.wrap(address(0x1)),
-                currency1: Currency.wrap(address(0x2)),
-                fee: 3000,
-                tickSpacing: 60,
-                hooks: IHooks(address(0))
-            }),
-            ModifyLiquidityParams({tickLower: -1000, tickUpper: 1000, liquidityDelta: 1000000, salt: bytes32(0)}),
-            bytes("")
+    /*//////////////////////////////////////////////////////////////
+                           DEPLOYMENT TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_HookDeployment_Success() public view {
+        // Verify hook is deployed
+        assertNotEq(address(hook), address(0), "Hook should be deployed");
+
+        (
+            bool beforeInitialize,
+            bool afterInitialize,
+            bool beforeAddLiquidity,
+            bool afterAddLiquidity,
+            bool beforeRemoveLiquidity,
+            bool afterRemoveLiquidity,
+            bool beforeSwap,
+            bool afterSwap,
+            bool beforeDonate,
+            bool afterDonate,
+            bool beforeSwapReturnDelta,
+            bool afterSwapReturnDelta,
+            bool afterAddLiquidityReturnDelta,
+            bool afterRemoveLiquidityReturnDelta
+        ) = HOOK_DEPLOYER.getPermissions(address(hook));
+
+        console2.log("Hook Permissions:");
+        console2.log("  beforeInitialize:", beforeInitialize);
+        console2.log("  afterInitialize:", afterInitialize);
+        console2.log("  beforeAddLiquidity:", beforeAddLiquidity);
+        console2.log("  afterAddLiquidity:", afterAddLiquidity);
+        console2.log("  beforeRemoveLiquidity:", beforeRemoveLiquidity);
+        console2.log("  afterRemoveLiquidity:", afterRemoveLiquidity);
+        console2.log("  beforeSwap:", beforeSwap);
+        console2.log("  afterSwap:", afterSwap);
+        console2.log("  beforeDonate:", beforeDonate);
+        console2.log("  afterDonate:", afterDonate);
+        console2.log("  beforeSwapReturnDelta:", beforeSwapReturnDelta);
+        console2.log("  afterSwapReturnDelta:", afterSwapReturnDelta);
+        console2.log("  afterAddLiquidityReturnDelta:", afterAddLiquidityReturnDelta);
+        console2.log("  afterRemoveLiquidityReturnDelta:", afterRemoveLiquidityReturnDelta);
+
+        console2.log(" Hook deployed at:", address(hook));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                         INITIALIZATION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_PoolInitialization_Success() public {
+        (, int24 baseTick,,) = POOL_MANAGER.getSlot0(basePoolKey.toId());
+        uint160 sqrtPrice = (baseTick - (baseTick % poolKey.tickSpacing)).getSqrtPriceAtTick();
+
+        POOL_MANAGER.initialize(poolKey, sqrtPrice);
+
+        // Verify pool state
+        (uint160 actualSqrtPrice, int24 tick,,) = POOL_MANAGER.getSlot0(poolId);
+        assertEq(actualSqrtPrice, sqrtPrice, "Price mismatch");
+
+        console2.log(" Pool initialized with sqrt price:", sqrtPrice);
+        console2.log(" Current tick:", tick);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                       LIQUIDITY MANAGEMENT TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_AddLiquidity_Success() public poolInitialized {
+        uint256 ethBalanceBefore = testAccount.balance;
+        uint256 usdcBalanceBefore = USDC.balanceOf(testAccount);
+
+        (bytes32 positionId, BalanceDelta feesAccrued, int24 tickLower, int24 tickUpper) =
+            _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
+
+        // Verify position was created
+        assertNotEq(positionId, bytes32(0), "Position ID should be generated");
+
+        // Verify fees are initially zero
+        assertEq(feesAccrued.amount0(), 0, "Initial fees should be zero");
+        assertEq(feesAccrued.amount1(), 0, "Initial fees should be zero");
+
+        // Verify liquidity was added
+        (,,, uint128 liquidity) = hook.getPoolState(poolKey.toId());
+        assertEq(uint128(LIQUIDITY_TO_ADD), liquidity, "Liquidity mismatch");
+
+        // Verify balances changed appropriately
+        assertLt(testAccount.balance, ethBalanceBefore, "ETH balance should decrease");
+        assertLt(USDC.balanceOf(testAccount), usdcBalanceBefore, "USDC balance should decrease");
+
+        // Verify pool metrics
+        PoolMetrics memory metrics = hook.getPositionData();
+        assertGt(metrics.totalCollateralETH, 0, "Should have collateral");
+
+        console2.log(" Position created with ID:", vm.toString(positionId));
+        console2.log(" Liquidity added:", liquidity);
+        console2.log(" Tick range:", tickLower);
+        console2.log(" to", tickUpper);
+
+        _logPoolMetrics(metrics);
+    }
+
+    function test_Borrow_Success() public poolInitialized {
+        _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
+
+        hook.borrow(address(USDC), 100 * 1e6);
+
+        // Verify pool metrics
+        PoolMetrics memory metrics = hook.getPositionData();
+        assertGt(metrics.totalCollateralETH, 0, "Should have collateral");
+
+        _logPoolMetrics(metrics);
+    }
+
+    function test_BorrowRepay_Success() public poolInitialized {
+        _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
+
+        hook.borrow(address(USDC), 100 * 1e6);
+
+        hook.repayWithATokens(address(USDC), 0, true);
+
+        PoolMetrics memory metrics = hook.getPositionData();
+        assertGt(metrics.totalCollateralETH, 0, "Should have collateral");
+        _logPoolMetrics(metrics);
+    }
+
+    function test_AddLeverageLiquidity_Success() public poolInitialized {
+        // snapshots before
+        uint256 ethBefore = testAccount.balance;
+        uint256 usdcBefore = USDC.balanceOf(testAccount);
+
+        USDC.approve(address(hook), type(uint256).max);
+
+        // execute liquidity addition (returns tick range)
+        (bytes32 positionId, BalanceDelta feesAccrued, int24 tickLower, int24 tickUpper) =
+            _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 4000);
+
+        // effective liquidity (with leverage factor)
+        // Assuming leverage scale is 1000 (1000 = 1x)
+        uint128 leveragedLiquidity = uint128(LIQUIDITY_TO_ADD) * 4;
+
+        (Slot0 slot0,,,) = hook.getPoolState(poolKey.toId());
+
+        uint160 sqrtLower = TickMath.getSqrtPriceAtTick(tickLower);
+        uint160 sqrtUpper = TickMath.getSqrtPriceAtTick(tickUpper);
+
+        //  total required amounts for leveraged liquidity
+        (uint256 required0, uint256 required1) =
+            LiquidityAmounts.getAmountsForLiquidity(slot0.sqrtPriceX96(), sqrtLower, sqrtUpper, leveragedLiquidity);
+
+        //  amounts actually paid by user
+        uint256 ethPaidByUser = ethBefore - testAccount.balance; // NOTE: includes gas noise
+        uint256 usdcPaidByUser = usdcBefore - USDC.balanceOf(testAccount);
+
+        //  infer leveraged portion (not covered by user)
+        uint256 ethLeverageInferred = required0 > ethPaidByUser ? required0 - ethPaidByUser : 0;
+        uint256 usdcLeverageInferred = required1 > usdcPaidByUser ? required1 - usdcPaidByUser : 0;
+
+        console2.log("=== Liquidity & Payment Summary ===");
+        console2.log("Required total token0:", required0);
+        console2.log("Required total token1:", required1);
+        console2.log("User paid token0 (ETH):", ethPaidByUser);
+        console2.log("User paid token1 (USDC):", usdcPaidByUser);
+        console2.log("Inferred leverage token0:", ethLeverageInferred);
+        console2.log("Inferred leverage token1:", usdcLeverageInferred);
+
+        PoolMetrics memory metrics = hook.getPositionData();
+        _logPoolMetrics(metrics);
+
+        assertNotEq(positionId, bytes32(0), "Position should be created");
+        assertEq(feesAccrued.amount0(), 0, "Initial fees token0 should be zero");
+        assertEq(feesAccrued.amount1(), 0, "Initial fees token1 should be zero");
+        assertGt(usdcPaidByUser + usdcLeverageInferred, 0, "No USDC contribution detected");
+    }
+
+    function test_RemoveLiquidity_Success() public poolInitialized {
+        // First add liquidity
+        (bytes32 positionId,,,) = _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
+
+        uint256 ethBalanceBefore = testAccount.balance;
+
+        // Remove liquidity
+        (BalanceDelta liquidityDelta,) = _removeLiquidity(positionId, -LIQUIDITY_TO_ADD);
+
+        // Verify liquidity was removed
+        assertGt(liquidityDelta.amount0(), 0, "Should return ETH");
+
+        WETH.withdraw(uint128(liquidityDelta.amount0()));
+
+        // Verify we got our ETH back
+        assertGt(testAccount.balance, ethBalanceBefore, "ETH balance should increase");
+
+        console2.log(" Liquidity removed successfully");
+        console2.log(" ETH returned:", uint256(uint128(liquidityDelta.amount0())));
+        console2.log(" USDC returned:", uint256(uint128(liquidityDelta.amount1())));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          LIQUIDITY RESTRICTION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_BeforeAddLiquidity_RevertWhen_DirectPositionManagerCall() public poolInitialized {
+        bytes memory actions =
+            abi.encodePacked(uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR), uint8(Actions.SWEEP));
+
+        bytes[] memory params = new bytes[](3);
+        Currency currency0 = Currency.wrap(address(0));
+        Currency currency1 = Currency.wrap(address(USDC));
+        IJITPoolManager.Window memory activeWindow = hook.getActiveWindows(poolKey, true)[0];
+
+        params[0] = abi.encode(
+            poolKey,
+            activeWindow.tickLower,
+            activeWindow.tickUpper,
+            100_000_000_000,
+            type(uint256).max,
+            type(uint256).max,
+            address(this),
+            ""
         );
 
-        bytes4 extractedSelector = testData.getSelector();
-        bytes4 expectedSelector = posm.modifyLiquidity.selector;
+        params[1] = abi.encode(currency0, currency1);
+        params[2] = abi.encode(address(0), address(this));
 
-        console.log("Expected selector:", vm.toString(expectedSelector));
-        console.log("Extracted selector:", vm.toString(extractedSelector));
+        uint256 deadline = block.timestamp + 60;
+        uint256 valueToPass = currency0.isAddressZero() ? 1 ether : 0;
 
-        assertEq(extractedSelector, expectedSelector, "Selector should match");
+        vm.expectRevert();
+        POSITION_MANAGER.modifyLiquidities{value: valueToPass}(abi.encode(actions, params), deadline);
+
+        console2.log(" Direct position manager call correctly reverted");
     }
 
-    function test_CalldataLibrary_GetModifyLiquidityParams() public view {
-        // Create test data
-        PoolKey memory originalKey = PoolKey({
-            currency0: Currency.wrap(0x82aF49447D8a07e3bd95BD0d56f35241523fBab1), // WETH on Arbitrum
-            currency1: Currency.wrap(0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9), // USDT on Arbitrum
-            fee: 3000,
-            tickSpacing: 60,
-            hooks: IHooks(address(0))
-        });
+    /*//////////////////////////////////////////////////////////////
+                              SWAP TESTS
+    //////////////////////////////////////////////////////////////*/
 
-        ModifyLiquidityParams memory originalParams = ModifyLiquidityParams({
-            tickLower: -887220, // Min tick
-            tickUpper: 887220, // Max tick
-            liquidityDelta: 1000000000000000000, // 1 ETH worth
-            salt: keccak256("test_salt")
-        });
+    function test_SwapWithJITLiquidity_Success() public poolInitialized {
+        // Add liquidity first
+        (,, int24 tickLower, int24 tickUpper) = _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
 
-        bytes memory originalHookData = abi.encode("test_hook_data", block.timestamp);
+        uint256 ethBalanceBefore = testAccount.balance;
 
-        // Encode the data as it would be passed to _unlockCallback
-        bytes memory testData =
-            abi.encodeWithSelector(posm.modifyLiquidity.selector, originalKey, originalParams, originalHookData);
+        // Perform swap
+        vm.deal(address(this), 1 ether);
+        _swap(SWAP_AMOUNT, true); // ETH -> USDC
 
-        // Extract the parameters
-        (PoolKey memory extractedKey, ModifyLiquidityParams memory extractedParams, bytes memory extractedHookData) =
-            testData.getModifyLiquidityParams();
+        // Verify swap occurred
+        assertLt(testAccount.balance, ethBalanceBefore, "ETH balance should decrease after swap");
 
-        // Verify PoolKey
-        assertEq(
-            Currency.unwrap(extractedKey.currency0), Currency.unwrap(originalKey.currency0), "Currency0 should match"
+        // Verify pool state after swap
+        (Slot0 slot0, uint256 fees0, uint256 fees1,) = hook.getPoolState(poolKey.toId());
+
+        // Calculate expected amounts
+        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(
+            slot0.sqrtPriceX96(),
+            tickLower.getSqrtPriceAtTick(),
+            tickUpper.getSqrtPriceAtTick(),
+            uint128(LIQUIDITY_TO_ADD)
         );
-        assertEq(
-            Currency.unwrap(extractedKey.currency1), Currency.unwrap(originalKey.currency1), "Currency1 should match"
+
+        // Verify fees were generated
+        assertTrue(fees0 > 0 || fees1 > 0, "Fees should be generated from swap");
+
+        PoolMetrics memory metrics = hook.getPositionData();
+        _logPoolMetrics(metrics);
+
+        console2.log(" Swap executed successfully");
+        console2.log(" Amount0 in position:", amount0);
+        console2.log(" Amount1 in position:", amount1);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                       INTEGRATION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_FullLifecycle_AddSwapRemove_Success() public poolInitialized {
+        // Record initial balances
+        uint256 initialETH = testAccount.balance;
+        uint256 initialUSDC = USDC.balanceOf(testAccount);
+
+        console2.log("=== INITIAL STATE ===");
+        console2.log("ETH balance:", initialETH);
+        console2.log("USDC balance:", initialUSDC);
+
+        // Add liquidity
+        (bytes32 positionId,,,) = _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
+
+        uint256 afterAddETH = testAccount.balance;
+        uint256 afterAddUSDC = USDC.balanceOf(testAccount);
+
+        console2.log("=== AFTER ADD LIQUIDITY ===");
+        console2.log("ETH balance:", afterAddETH);
+        console2.log("USDC balance:", afterAddUSDC);
+        console2.log("ETH used:", initialETH - afterAddETH);
+        console2.log("USDC used:", initialUSDC - afterAddUSDC);
+
+        // Execute multiple swaps to generate fees
+        vm.startPrank(WHALE);
+        PERMIT2.approve(
+            Currency.unwrap(poolKey.currency1), address(ROUTER), type(uint160).max, uint48(block.timestamp + 1 days)
         );
-        assertEq(extractedKey.fee, originalKey.fee, "Fee should match");
-        assertEq(extractedKey.tickSpacing, originalKey.tickSpacing, "TickSpacing should match");
-        assertEq(address(extractedKey.hooks), address(originalKey.hooks), "Hooks should match");
+        USDC.approve(address(PERMIT2), type(uint256).max);
 
-        // Verify ModifyLiquidityParams
-        assertEq(extractedParams.tickLower, originalParams.tickLower, "TickLower should match");
-        assertEq(extractedParams.tickUpper, originalParams.tickUpper, "TickUpper should match");
-        assertEq(extractedParams.liquidityDelta, originalParams.liquidityDelta, "LiquidityDelta should match");
-        assertEq(extractedParams.salt, originalParams.salt, "Salt should match");
-
-        // Verify hook data
-        assertEq(extractedHookData, originalHookData, "Hook data should match");
-
-        console.log("All parameters extracted correctly!");
-    }
-
-    function test_ModifyLiquidity_EndToEnd() public {
-        // Create realistic test parameters
-        PoolKey memory key = PoolKey({
-            currency0: Currency.wrap(0x82aF49447D8a07e3bd95BD0d56f35241523fBab1), // WETH
-            currency1: Currency.wrap(0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9), // USDT
-            fee: 3000,
-            tickSpacing: 60,
-            hooks: IHooks(address(0))
-        });
-
-        ModifyLiquidityParams memory params = ModifyLiquidityParams({
-            tickLower: -60, // One tick below current
-            tickUpper: 60, // One tick above current
-            liquidityDelta: 1000000000000000000, // 1 ETH worth of liquidity
-            salt: keccak256(abi.encode("test", block.timestamp))
-        });
-
-        bytes memory hookData = abi.encode("integration_test", block.number);
-
-        // Call modifyLiquidity
-        posm.modifyLiquidity(key, params, hookData);
-
-        console.log("End-to-end test passed - data flows correctly through the system");
-    }
-
-    function test_ModifyLiquidity_MultipleParams() public {
-        // Test with various parameter combinations to ensure robustness
-        PoolKey memory key = PoolKey({
-            currency0: Currency.wrap(address(0x1)),
-            currency1: Currency.wrap(address(0x2)),
-            fee: 500,
-            tickSpacing: 10,
-            hooks: IHooks(address(0x123))
-        });
-
-        ModifyLiquidityParams[3] memory paramsList = [
-            ModifyLiquidityParams({tickLower: -1000, tickUpper: 1000, liquidityDelta: 1000, salt: bytes32(uint256(1))}),
-            ModifyLiquidityParams({
-                tickLower: -500,
-                tickUpper: 500,
-                liquidityDelta: -500, // Removing liquidity
-                salt: bytes32(uint256(2))
-            }),
-            ModifyLiquidityParams({
-                tickLower: 0,
-                tickUpper: 1000,
-                liquidityDelta: 2000,
-                salt: bytes32(0) // Zero salt
-            })
-        ];
-
-        for (uint256 i = 0; i < paramsList.length; i++) {
-            bytes memory hookData = abi.encode("test", i);
-
-            posm.modifyLiquidity(key, paramsList[i], hookData);
-
-            console.log("Test case", i, "passed");
+        // Perform alternating swaps
+        for (uint8 i = 0; i < 100; i++) {
+            if (i % 2 == 0) {
+                _swap(SWAP_AMOUNT * 10, true); // ETH -> USDC
+            } else {
+                _swap(1_000_000, false); // USDC -> ETH
+            }
         }
+        vm.stopPrank();
+
+        console2.log("=== AFTER SWAPS ===");
+        PoolMetrics memory metricsAfterSwaps = hook.getPositionData();
+        _logPoolMetrics(metricsAfterSwaps);
+
+        // Remove liquidity
+        (BalanceDelta liquidityDelta,) = _removeLiquidity(positionId, -LIQUIDITY_TO_ADD);
+
+        uint256 finalETH = testAccount.balance + IERC20(address(WETH)).balanceOf(address(this));
+        uint256 finalUSDC = USDC.balanceOf(testAccount);
+
+        console2.log("=== FINAL STATE ===");
+        console2.log("ETH balance:", finalETH);
+        console2.log("USDC balance:", finalUSDC);
+        console2.log("Net ETH change:", int256(finalETH) - int256(initialETH));
+        console2.log("Net USDC change:", int256(finalUSDC) - int256(initialUSDC));
+        console2.log("Liquidity delta ETH:", liquidityDelta.amount0());
+        console2.log("Liquidity delta USDC:", liquidityDelta.amount1());
+
+        // Hook should not retain significant balances
+        uint256 hookETHBalance = address(hook).balance + IERC20(address(WETH)).balanceOf(address(hook));
+        uint256 hookUSDCBalance = USDC.balanceOf(address(hook));
+
+        console2.log("=== HOOK BALANCES ===");
+        console2.log("Hook ETH balance:", hookETHBalance);
+        console2.log("Hook USDC balance:", hookUSDCBalance);
+
+        assertLt(hookETHBalance, 0.01 ether, "Hook ETH balance too high");
+        assertLt(hookUSDCBalance, 1000, "Hook USDC balance too high");
     }
 
-    function test_CalldataLibrary_EdgeCases() public view {
-        // Test with minimal data (just selector)
-        bytes memory minimalData = abi.encodeWithSelector(posm.modifyLiquidity.selector);
-        bytes4 selector = minimalData.getSelector();
-        assertEq(selector, posm.modifyLiquidity.selector, "Should extract selector from minimal data");
+    /*//////////////////////////////////////////////////////////////
+                           HELPER FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
 
-        // Test with extra data after the expected parameters
-        bytes memory dataWithExtra = abi.encodePacked(
-            abi.encodeWithSelector(
-                posm.modifyLiquidity.selector,
-                PoolKey({
-                    currency0: Currency.wrap(address(0x1)),
-                    currency1: Currency.wrap(address(0x2)),
-                    fee: 3000,
-                    tickSpacing: 60,
-                    hooks: IHooks(address(0))
-                }),
-                ModifyLiquidityParams({tickLower: -1000, tickUpper: 1000, liquidityDelta: 1000000, salt: bytes32(0)}),
-                bytes("")
-            ),
-            bytes("extra_data_that_should_be_ignored")
+    function _deployHook() private {
+        uint160 flags = uint160(
+            Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
+                | Hooks.AFTER_INITIALIZE_FLAG
         );
 
-        // Should still extract correctly
-        (PoolKey memory key, ModifyLiquidityParams memory params, bytes memory hookData) =
-            dataWithExtra.getModifyLiquidityParams();
+        uint160[] memory _flags = new uint160[](4);
+        _flags[0] = Hooks.BEFORE_SWAP_FLAG;
+        _flags[1] = Hooks.AFTER_SWAP_FLAG;
+        _flags[2] = Hooks.BEFORE_ADD_LIQUIDITY_FLAG;
+        _flags[3] = Hooks.AFTER_INITIALIZE_FLAG;
 
-        assertEq(Currency.unwrap(key.currency0), address(0x1), "Should extract key correctly despite extra data");
-        assertEq(params.liquidityDelta, 1000000, "Should extract params correctly despite extra data");
-        assertEq(hookData.length, 0, "Should extract empty hook data correctly");
+        bytes memory constructorArgs = abi.encode(address(this), POOL_MANAGER, WETH, AAVE_POOL);
+        (address hookAddress, bytes32 salt) =
+            HookMiner.find(address(HOOK_DEPLOYER), flags, type(SymbioteHook).creationCode, constructorArgs);
+
+        hook = SymbioteHook(
+            payable(HOOK_DEPLOYER.safeDeploy(type(SymbioteHook).creationCode, constructorArgs, salt, hookAddress, _flags))
+        );
+
+        require(address(hook) == hookAddress, "Hook address mismatch");
     }
 
-    // Helper function to log parameter details
-    function logParams(PoolKey memory key, ModifyLiquidityParams memory params, bytes memory hookData) internal pure {
-        console.log("=== Parameters ===");
-        console.log("Currency0:", Currency.unwrap(key.currency0));
-        console.log("Currency1:", Currency.unwrap(key.currency1));
-        console.log("Fee:", key.fee);
-        console.log("TickSpacing:", key.tickSpacing);
-        console.log("Hooks:", address(key.hooks));
-        console.log("TickLower:", vm.toString(params.tickLower));
-        console.log("TickUpper:", vm.toString(params.tickUpper));
-        console.log("LiquidityDelta:", vm.toString(params.liquidityDelta));
-        console.log("Salt:", vm.toString(params.salt));
-        console.log("HookData length:", hookData.length);
+    function _configurePoolKeys() private {
+        poolKey = PoolKey({
+            currency0: Currency.wrap(address(0)), // ETH
+            currency1: Currency.wrap(address(USDC)),
+            fee: DEFAULT_FEE,
+            tickSpacing: TICK_SPACING,
+            hooks: IHooks(address(hook))
+        });
+
+        basePoolKey = PoolKey({
+            currency0: Currency.wrap(address(0)), // ETH
+            currency1: Currency.wrap(address(USDC)),
+            fee: 100,
+            tickSpacing: 1,
+            hooks: IHooks(address(0))
+        });
+
+        poolId = poolKey.toId();
+    }
+
+    function _setupApprovals() private {
+        USDC.approve(address(hook), type(uint256).max);
+        USDC.approve(address(PERMIT2), type(uint256).max);
+    }
+
+    function _validateSetup() private view {
+        require(testAccount.balance > 100 ether, "Insufficient ETH for testing");
+        require(USDC.balanceOf(testAccount) > 1_000_000 * 1e6, "Insufficient USDC for testing");
+        require(address(hook) != address(0), "Hook not deployed");
+    }
+
+    function _initializePool() private {
+        (, int24 baseTick,,) = POOL_MANAGER.getSlot0(basePoolKey.toId());
+        uint160 sqrtPrice = (baseTick - (baseTick % poolKey.tickSpacing)).getSqrtPriceAtTick();
+        POOL_MANAGER.initialize(poolKey, sqrtPrice);
+    }
+
+    function _addLiquidity(int24 rangeLower, int24 rangeUpper, int128 liquidity, uint16 leverage)
+        private
+        returns (bytes32 positionId, BalanceDelta feesAccrued, int24 tickLower, int24 tickUpper)
+    {
+        IJITPoolManager.Window memory activeWindow = hook.getActiveWindows(poolKey, true)[0];
+        tickLower = activeWindow.tickLower + (rangeLower * poolKey.tickSpacing);
+        tickUpper = activeWindow.tickUpper + (rangeUpper * poolKey.tickSpacing);
+
+        ModifyLiquidityWindow memory params = ModifyLiquidityWindow({
+            rangeLower: rangeLower,
+            rangeUpper: rangeUpper,
+            liquidityDelta: liquidity,
+            salt: bytes32(0),
+            leverage: leverage
+        });
+
+        uint256 ethValue = LiquidityAmounts.getAmount0ForLiquidity(
+            tickLower.getSqrtPriceAtTick(), tickUpper.getSqrtPriceAtTick(), uint128(liquidity)
+        );
+
+        require(ethValue <= address(this).balance, "Insufficient ETH for liquidity");
+
+        (positionId,, feesAccrued) = hook.addLiquidity{value: ethValue}(poolKey, params);
+    }
+
+    function _removeLiquidity(bytes32 positionId, int128 liquidity)
+        private
+        returns (BalanceDelta liquidityDelta, BalanceDelta feesAccrued)
+    {
+        (liquidityDelta, feesAccrued) = hook.removeLiquidity(poolKey, positionId, liquidity);
+    }
+
+    function _swap(uint128 amountIn, bool zeroForOne) private {
+        bytes memory commands = abi.encodePacked(uint8(Commands.V4_SWAP));
+        bytes memory actions =
+            abi.encodePacked(uint8(Actions.SWAP_EXACT_IN_SINGLE), uint8(Actions.SETTLE_ALL), uint8(Actions.TAKE_ALL));
+
+        bytes[] memory params = new bytes[](3);
+        params[0] = abi.encode(
+            IV4Router.ExactInputSingleParams({
+                poolKey: poolKey,
+                zeroForOne: zeroForOne,
+                amountIn: amountIn,
+                amountOutMinimum: 0,
+                hookData: bytes("")
+            })
+        );
+
+        params[1] = abi.encode(zeroForOne ? poolKey.currency0 : poolKey.currency1, amountIn);
+        params[2] = abi.encode(zeroForOne ? poolKey.currency1 : poolKey.currency0, 0);
+
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = abi.encode(actions, params);
+
+        uint256 deadline = block.timestamp + 60;
+
+        if (!zeroForOne) {
+            PERMIT2.approve(
+                Currency.unwrap(poolKey.currency1), address(ROUTER), type(uint160).max, uint48(block.timestamp + 1 days)
+            );
+        }
+
+        ROUTER.execute{value: zeroForOne ? amountIn : 0}(commands, inputs, deadline);
+    }
+
+    function _logPoolMetrics(PoolMetrics memory metrics) private pure {
+        console2.log("--- Pool Metrics ---");
+        console2.log("Total collateral (ETH):", metrics.totalCollateralETH);
+        console2.log("Total debt (ETH):", metrics.totalDebtETH);
+        console2.log("Available borrows (ETH):", metrics.availableBorrowsETH);
+        console2.log("Liquidation threshold:", metrics.currentLiquidationThreshold);
+        console2.log("LTV:", metrics.ltv);
+        console2.log("Health factor:", metrics.healthFactor);
+        console2.log("-------------------");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                           RECEIVE FUNCTION
+    //////////////////////////////////////////////////////////////*/
+
+    receive() external payable {
+        // Allow contract to receive ETH
     }
 }
