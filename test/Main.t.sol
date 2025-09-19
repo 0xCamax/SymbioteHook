@@ -477,7 +477,9 @@ contract SymbioteHookTests is Test, AbritrumConstants {
             HookMiner.find(address(HOOK_DEPLOYER), flags, type(SymbioteHook).creationCode, constructorArgs);
 
         hook = SymbioteHook(
-            payable(HOOK_DEPLOYER.safeDeploy(type(SymbioteHook).creationCode, constructorArgs, salt, hookAddress, _flags))
+            payable(
+                HOOK_DEPLOYER.safeDeploy(type(SymbioteHook).creationCode, constructorArgs, salt, hookAddress, _flags)
+            )
         );
 
         require(address(hook) == hookAddress, "Hook address mismatch");

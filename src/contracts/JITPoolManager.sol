@@ -28,7 +28,6 @@ import {LiquidityMath} from "../libraries/LiquidityMath.sol";
 import {SafeCallback} from "@uniswap/v4-periphery/src/base/SafeCallback.sol";
 import {LiquidityAmounts} from "../libraries/LiquidityAmounts.sol";
 
-
 /**
  * @notice Information about a specific liquidity position
  * @dev Tracks ownership and parameters of user positions
@@ -762,7 +761,6 @@ abstract contract JITPoolManager is ProtocolFees, Extsload, Exttload, IJITPoolMa
     function _repayWithATokens(address asset, uint256 amount, bool max) internal returns (uint256) {
         return aavePool.repayWithATokens(asset, max ? type(uint256).max : amount, 2);
     }
-
 
     /**
      * @notice Handles ETH deposits and WETH wrapping

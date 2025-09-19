@@ -25,10 +25,10 @@ contract HookScript is Script, AbritrumConstants {
         _flags[2] = Hooks.BEFORE_ADD_LIQUIDITY_FLAG;
         _flags[3] = Hooks.AFTER_INITIALIZE_FLAG;
 
-        bytes memory constructorArgs = abi.encode(0xEC08EfF77496601BE56c11028A516366DbF03F13, POOL_MANAGER, WETH, AAVE_POOL);
+        bytes memory constructorArgs =
+            abi.encode(0xEC08EfF77496601BE56c11028A516366DbF03F13, POOL_MANAGER, WETH, AAVE_POOL);
         (address hookAddress, bytes32 salt) =
             HookMiner.find(address(HOOK_DEPLOYER), flags, type(SymbioteHook).creationCode, constructorArgs);
-
 
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         vm.broadcast(deployerPrivateKey);
