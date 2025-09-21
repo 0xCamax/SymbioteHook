@@ -380,9 +380,6 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         d0 = int128(poolManager.currencyDelta(address(this), key.currency0));
         d1 = int128(poolManager.currencyDelta(address(this), key.currency1));
 
-        console2.log(d0);
-        console2.log(d1);
-
         if (d0 < 0) {
             aavePool.borrow(a0, uint128(-d0));
             _settle(key.currency0, address(this), d0);
