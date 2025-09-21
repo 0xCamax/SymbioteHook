@@ -44,51 +44,49 @@ struct PoolMetrics {
 library AaveHelper {
     using AaveHelper for IPool;
 
-    function init(IPool pool, address asset0, address asset1) internal returns (bool ok0, bool ok1) {
-        try pool.setUserUseReserveAsCollateral(asset0, true) {
-            ok0 = true;
-        } catch {
-            ok0 = false;
-        }
-        try pool.setUserUseReserveAsCollateral(asset1, true) {
-            ok1 = true;
-        } catch {
-            ok1 = false;
-        }
+    function _supplyToAave(IPool pool, address asset, uint128 amount) private {
+        IERC20(asset).approve(address(pool), amount);
+        pool.supply(asset, amount, address(this), 0);
     }
 
     function modifyLiquidity(IPool pool, ModifyLiquidityAave memory params) internal {
         int128 amount0 = params.delta.amount0();
         int128 amount1 = params.delta.amount1();
-        if (amount0 < 0) {
-            IERC20(params.asset0).approve(address(pool), uint128(-amount0));
-            pool.supply(params.asset0, uint128(-amount0), address(this), 0);
-        }
-        if (amount1 < 0) {
-            IERC20(params.asset1).approve(address(pool), uint128(-amount1));
-            pool.supply(params.asset1, uint128(-amount1), address(this), 0);
-        }
-        if (amount0 > 0) {
-            pool.withdraw(params.asset0, uint128(amount0), params.user);
-        }
-        if (amount1 > 0) {
-            pool.withdraw(params.asset1, uint128(amount1), params.user);
-        }
+
+        // Supply negative amounts (using helper)
+        if (amount0 < 0) _supplyToAave(pool, params.asset0, uint128(-amount0));
+        if (amount1 < 0) _supplyToAave(pool, params.asset1, uint128(-amount1));
+
+        // Withdraw positive amounts (direct calls)
+        if (amount0 > 0) pool.withdraw(params.asset0, uint128(amount0), params.user);
+        if (amount1 > 0) pool.withdraw(params.asset1, uint128(amount1), params.user);
     }
 
     function swap(IPool pool, SwapParamsAave memory params) internal {
         int128 amount0 = params.delta.amount0();
         int128 amount1 = params.delta.amount1();
         require(amount0 > 0 || amount1 > 0);
+
         if (amount0 > amount1) {
-            IERC20(params.asset0).approve(address(pool), uint128(amount0));
-            pool.supply(params.asset0, uint128(amount0), address(this), 0);
+            _supplyToAave(pool, params.asset0, uint128(amount0));
             pool.withdraw(params.asset1, uint128(-amount1), address(this));
         } else {
-            IERC20(params.asset1).approve(address(pool), uint128(amount1));
-            pool.supply(params.asset1, uint128(amount1), address(this), 0);
+            _supplyToAave(pool, params.asset1, uint128(amount1));
             pool.withdraw(params.asset0, uint128(-amount0), address(this));
         }
+    }
+
+    function borrow(IPool pool, address asset, uint256 amount) internal {
+        pool.setUserUseReserveAsCollateral(asset, true);
+        pool.borrow(asset, amount, 2, 0, address(this));
+    }
+
+    function repay(IPool pool, address asset, uint256 amount, bool max) internal {
+        pool.repay(asset, max ? type(uint256).max : amount, 2, address(this));
+    }
+
+        function repayWithATokens(IPool pool, address asset, uint256 amount, bool max) internal returns (uint256) {
+        return pool.repayWithATokens(asset, max ? type(uint256).max : amount, 2);
     }
 
     function maxBorrow(IPool pool, address asset, uint256 amount) internal view returns (uint256) {

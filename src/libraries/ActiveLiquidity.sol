@@ -2,58 +2,62 @@
 pragma solidity ^0.8.20;
 
 library ActiveLiquidityLibrary {
-    bytes32 private constant SLOT = keccak256("ActiveLiquidity.ref");
-    bytes32 private constant SLOT0 = keccak256(abi.encodePacked(SLOT, uint256(0)));
-    bytes32 private constant SLOT1 = keccak256(abi.encodePacked(SLOT, uint256(1)));
+    bytes32 private constant SLOT = keccak256("ActiveLiquidity");
 
+    /// @notice Checks if active liquidity exists
     function isActive() internal view returns (bool active) {
         bytes32 slot = SLOT;
         assembly {
-            active := tload(slot)
+            let data := sload(slot)
+            active := and(shr(224, data), 1) // bit 224 reserved for the bool
         }
     }
 
-    /* -------------------------- store/load two refs -------------------------- */
-
-    /// @notice Store both int24 refs into transient storage
-    function setRefs(int24 ref0, int24 ref1) internal {
-        bool active = true;
+    /// @notice Sets active liquidity and tick bounds
+    function set(int24 tL, int24 tU, uint128 l) internal {
         bytes32 slot = SLOT;
-        bytes32 slot0 = SLOT0;
-        bytes32 slot1 = SLOT1;
+        uint256 data = 0;
+        // l: bits 0-127
+        data |= uint256(l);
+        // tL: bits 128-151
+        data |= uint256(uint24(tL)) << 128;
+        // tU: bits 152-175
+        data |= uint256(uint24(tU)) << 152;
+        // active: bit 224
+        data |= 1 << 224;
         assembly {
-            tstore(slot, active)
-            tstore(slot0, ref0)
-            tstore(slot1, ref1)
+            sstore(slot, data)
         }
     }
 
-    /// @notice Load first ref (int24)
-    function getRef0() internal view returns (int24 ref0) {
-        bytes32 slot0 = SLOT0;
-        assembly {
-            ref0 := tload(slot0)
-        }
-    }
-
-    /// @notice Load second ref (int24)
-    function getRef1() internal view returns (int24 ref1) {
-        bytes32 slot1 = SLOT1;
-        assembly {
-            ref1 := tload(slot1)
-        }
-    }
-
-    function getRefs() internal view returns (int24 ref0, int24 ref1) {
-        ref0 = getRef0();
-        ref1 = getRef1();
-    }
-
-    function toggleActive() internal {
-        bool active = !ActiveLiquidityLibrary.isActive();
+    /// @notice Gets active liquidity, tick bounds, and state
+    function get() internal view returns (uint128 l, int24 tL, int24 tU, bool active) {
         bytes32 slot = SLOT;
         assembly {
-            tstore(slot, active)
+            let data := sload(slot)
+            l := and(data, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF)              // bits 0-127
+            tL := and(shr(128, data), 0xFFFFFF)                            // bits 128-151
+            tU := and(shr(152, data), 0xFFFFFF)                            // bits 152-175
+            active := eq(and(shr(224, data), 1), 1)                        // bit 224
+        }
+    }
+
+    /// @notice Toggles the active state
+    function toggle() internal {
+        bytes32 slot = SLOT;
+        assembly {
+            let data := sload(slot)
+            data := xor(data, shl(224, 1)) // toggle bit 224
+            sstore(slot, data)
+        }
+    }
+
+    /// @notice Clears the entire slot
+    function clear() internal {
+        bytes32 slot = SLOT;
+        assembly {
+            sstore(slot, 0)
         }
     }
 }
+

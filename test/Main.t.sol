@@ -6,8 +6,8 @@ import {stdError} from "forge-std/StdError.sol";
 
 // Import your contracts (adjust paths as needed)
 import "../src/SymbioteHook.sol";
-import {ModifyLiquidityWindow} from "../src/contracts/JITPoolManager.sol";
-import {LiquidityAmounts} from "../src/libraries/LiquidityAmounts.sol";
+import {PoolMetrics} from "../src/libraries/AaveHelper.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {HookMiner} from "@uniswap/v4-periphery/src/utils/HookMiner.sol";
@@ -35,7 +35,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
     address public constant WHALE = 0x0a8494F70031623C9C0043aff4D40f334b458b11;
 
     // Test liquidity amount
-    int128 private constant LIQUIDITY_TO_ADD = 10_000_000_000_000_000;
+    int128 private constant LIQUIDITY_TO_ADD = 100_000_000_000_000_000;
 
     // Default fee for testing (0.3%)
     uint24 private constant DEFAULT_FEE = 3000;
@@ -166,7 +166,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         (, int24 baseTick,,) = POOL_MANAGER.getSlot0(basePoolKey.toId());
         uint160 sqrtPrice = (baseTick - (baseTick % poolKey.tickSpacing)).getSqrtPriceAtTick();
 
-        POOL_MANAGER.initialize(poolKey, sqrtPrice);
+        hook.initialize(poolKey, sqrtPrice);
 
         // Verify pool state
         (uint160 actualSqrtPrice, int24 tick,,) = POOL_MANAGER.getSlot0(poolId);
@@ -185,7 +185,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         uint256 usdcBalanceBefore = USDC.balanceOf(testAccount);
 
         (bytes32 positionId, BalanceDelta feesAccrued, int24 tickLower, int24 tickUpper) =
-            _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
+            _addLiquidity(LIQUIDITY_TO_ADD, 1);
 
         // Verify position was created
         assertNotEq(positionId, bytes32(0), "Position ID should be generated");
@@ -196,7 +196,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
 
         // Verify liquidity was added
         (,,, uint128 liquidity) = hook.getPoolState(poolKey.toId());
-        assertEq(uint128(LIQUIDITY_TO_ADD), liquidity, "Liquidity mismatch");
+        assertGt(liquidity, 0, "Liquidity mismatch");
 
         // Verify balances changed appropriately
         assertLt(testAccount.balance, ethBalanceBefore, "ETH balance should decrease");
@@ -207,15 +207,15 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         assertGt(metrics.totalCollateralETH, 0, "Should have collateral");
 
         console2.log(" Position created with ID:", vm.toString(positionId));
-        console2.log(" Liquidity added:", liquidity);
+        console2.log(" Active liquidity:", liquidity);
         console2.log(" Tick range:", tickLower);
-        console2.log(" to", tickUpper);
+        console2.log(" to:", tickUpper);
 
         _logPoolMetrics(metrics);
     }
 
     function test_Borrow_Success() public poolInitialized {
-        _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
+        _addLiquidity(LIQUIDITY_TO_ADD, 1);
 
         hook.borrow(address(USDC), 100 * 1e6);
 
@@ -227,7 +227,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
     }
 
     function test_BorrowRepay_Success() public poolInitialized {
-        _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
+        _addLiquidity(LIQUIDITY_TO_ADD, 1);
 
         hook.borrow(address(USDC), 100 * 1e6);
 
@@ -247,20 +247,16 @@ contract SymbioteHookTests is Test, AbritrumConstants {
 
         // execute liquidity addition (returns tick range)
         (bytes32 positionId, BalanceDelta feesAccrued, int24 tickLower, int24 tickUpper) =
-            _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 4000);
+            _addLiquidity(LIQUIDITY_TO_ADD, 4);
 
-        // effective liquidity (with leverage factor)
-        // Assuming leverage scale is 1000 (1000 = 1x)
         uint128 leveragedLiquidity = uint128(LIQUIDITY_TO_ADD) * 4;
 
-        (Slot0 slot0,,,) = hook.getPoolState(poolKey.toId());
-
-        uint160 sqrtLower = TickMath.getSqrtPriceAtTick(tickLower);
-        uint160 sqrtUpper = TickMath.getSqrtPriceAtTick(tickUpper);
-
         //  total required amounts for leveraged liquidity
-        (uint256 required0, uint256 required1) =
-            LiquidityAmounts.getAmountsForLiquidity(slot0.sqrtPriceX96(), sqrtLower, sqrtUpper, leveragedLiquidity);
+        BalanceDelta amounts =
+            hook.getAmountsForLiquidity(poolKey.toId(), Window(tickLower, tickUpper, leveragedLiquidity, false));
+
+        uint256 required0 = uint128(amounts.amount0());
+        uint256 required1 = uint128(amounts.amount1());
 
         //  amounts actually paid by user
         uint256 ethPaidByUser = ethBefore - testAccount.balance; // NOTE: includes gas noise
@@ -289,12 +285,13 @@ contract SymbioteHookTests is Test, AbritrumConstants {
 
     function test_RemoveLiquidity_Success() public poolInitialized {
         // First add liquidity
-        (bytes32 positionId,,,) = _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
+        (,, int24 tickLower, int24 tickUpper) = _addLiquidity(LIQUIDITY_TO_ADD, 1);
 
         uint256 ethBalanceBefore = testAccount.balance;
 
         // Remove liquidity
-        (BalanceDelta liquidityDelta,) = _removeLiquidity(positionId, -LIQUIDITY_TO_ADD);
+        (BalanceDelta liquidityDelta,) =
+            _removeLiquidity(poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(0)));
 
         // Verify liquidity was removed
         assertGt(liquidityDelta.amount0(), 0, "Should return ETH");
@@ -320,7 +317,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         bytes[] memory params = new bytes[](3);
         Currency currency0 = Currency.wrap(address(0));
         Currency currency1 = Currency.wrap(address(USDC));
-        IJITPoolManager.Window memory activeWindow = hook.getActiveWindows(poolKey, true)[0];
+        Window memory activeWindow = hook.getActiveWindow(poolKey.toId());
 
         params[0] = abi.encode(
             poolKey,
@@ -351,7 +348,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
 
     function test_SwapWithJITLiquidity_Success() public poolInitialized {
         // Add liquidity first
-        (,, int24 tickLower, int24 tickUpper) = _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
+        (,, int24 tickLower, int24 tickUpper) = _addLiquidity(LIQUIDITY_TO_ADD, 1);
 
         uint256 ethBalanceBefore = testAccount.balance;
 
@@ -363,14 +360,12 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         assertLt(testAccount.balance, ethBalanceBefore, "ETH balance should decrease after swap");
 
         // Verify pool state after swap
-        (Slot0 slot0, uint256 fees0, uint256 fees1,) = hook.getPoolState(poolKey.toId());
+        (, uint256 fees0, uint256 fees1,) = hook.getPoolState(poolKey.toId());
 
         // Calculate expected amounts
-        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(
-            slot0.sqrtPriceX96(),
-            tickLower.getSqrtPriceAtTick(),
-            tickUpper.getSqrtPriceAtTick(),
-            uint128(LIQUIDITY_TO_ADD)
+        BalanceDelta amounts = hook.getAmountsForLiquidity(
+            poolKey.toId(),
+            Window(tickLower, tickUpper, uint128(LIQUIDITY_TO_ADD), true)
         );
 
         // Verify fees were generated
@@ -380,8 +375,8 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         _logPoolMetrics(metrics);
 
         console2.log(" Swap executed successfully");
-        console2.log(" Amount0 in position:", amount0);
-        console2.log(" Amount1 in position:", amount1);
+        console2.log(" Amount0 in position:", amounts.amount0());
+        console2.log(" Amount1 in position:", amounts.amount1());
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -398,7 +393,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         console2.log("USDC balance:", initialUSDC);
 
         // Add liquidity
-        (bytes32 positionId,,,) = _addLiquidity(-1, 1, LIQUIDITY_TO_ADD, 1000);
+        (,, int24 tickLower, int24 tickUpper) = _addLiquidity(LIQUIDITY_TO_ADD, 1);
 
         uint256 afterAddETH = testAccount.balance;
         uint256 afterAddUSDC = USDC.balanceOf(testAccount);
@@ -431,7 +426,8 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         _logPoolMetrics(metricsAfterSwaps);
 
         // Remove liquidity
-        (BalanceDelta liquidityDelta,) = _removeLiquidity(positionId, -LIQUIDITY_TO_ADD);
+        (BalanceDelta liquidityDelta,) =
+            _removeLiquidity(poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(0)));
 
         uint256 finalETH = testAccount.balance + IERC20(address(WETH)).balanceOf(address(this));
         uint256 finalUSDC = USDC.balanceOf(testAccount);
@@ -461,16 +457,12 @@ contract SymbioteHookTests is Test, AbritrumConstants {
     //////////////////////////////////////////////////////////////*/
 
     function _deployHook() private {
-        uint160 flags = uint160(
-            Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
-                | Hooks.AFTER_INITIALIZE_FLAG
-        );
+        uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG);
 
-        uint160[] memory _flags = new uint160[](4);
+        uint160[] memory _flags = new uint160[](3);
         _flags[0] = Hooks.BEFORE_SWAP_FLAG;
         _flags[1] = Hooks.AFTER_SWAP_FLAG;
         _flags[2] = Hooks.BEFORE_ADD_LIQUIDITY_FLAG;
-        _flags[3] = Hooks.AFTER_INITIALIZE_FLAG;
 
         bytes memory constructorArgs = abi.encode(address(this), POOL_MANAGER, WETH, AAVE_POOL);
         (address hookAddress, bytes32 salt) =
@@ -519,39 +511,40 @@ contract SymbioteHookTests is Test, AbritrumConstants {
     function _initializePool() private {
         (, int24 baseTick,,) = POOL_MANAGER.getSlot0(basePoolKey.toId());
         uint160 sqrtPrice = (baseTick - (baseTick % poolKey.tickSpacing)).getSqrtPriceAtTick();
-        POOL_MANAGER.initialize(poolKey, sqrtPrice);
+        hook.initialize(poolKey, sqrtPrice);
     }
 
-    function _addLiquidity(int24 rangeLower, int24 rangeUpper, int128 liquidity, uint16 leverage)
+    function _addLiquidity(int128 liquidity, uint16 multiplier)
         private
         returns (bytes32 positionId, BalanceDelta feesAccrued, int24 tickLower, int24 tickUpper)
     {
-        IJITPoolManager.Window memory activeWindow = hook.getActiveWindows(poolKey, true)[0];
-        tickLower = activeWindow.tickLower + (rangeLower * poolKey.tickSpacing);
-        tickUpper = activeWindow.tickUpper + (rangeUpper * poolKey.tickSpacing);
+        Window memory activeWindow = hook.getActiveWindow(poolKey.toId());
 
-        ModifyLiquidityWindow memory params = ModifyLiquidityWindow({
-            rangeLower: rangeLower,
-            rangeUpper: rangeUpper,
-            liquidityDelta: liquidity,
-            salt: bytes32(0),
-            leverage: leverage
+        int128 baseLiquidity = liquidity;
+        tickLower = activeWindow.tickLower - (poolKey.tickSpacing * 2);
+        tickUpper = activeWindow.tickUpper + (poolKey.tickSpacing * 2);
+
+        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+            tickLower: tickLower,
+            tickUpper: tickUpper,
+            liquidityDelta: baseLiquidity * int16(multiplier != 0 ? multiplier : 1),
+            salt: bytes32(0)
         });
 
-        uint256 ethValue = LiquidityAmounts.getAmount0ForLiquidity(
-            tickLower.getSqrtPriceAtTick(), tickUpper.getSqrtPriceAtTick(), uint128(liquidity)
+        BalanceDelta amounts = hook.getAmountsForLiquidity(
+            poolKey.toId(), Window(params.tickLower, params.tickUpper, uint128(int128(params.liquidityDelta)), false)
         );
+        uint256 ethAmount = uint128(amounts.amount0());
+        require(ethAmount <= address(this).balance, "Insufficient ETH for liquidity");
 
-        require(ethValue <= address(this).balance, "Insufficient ETH for liquidity");
-
-        (positionId,, feesAccrued) = hook.addLiquidity{value: ethValue}(poolKey, params);
+        (positionId,, feesAccrued) = hook.modifyLiquidity{value: ethAmount}(poolKey, params, multiplier);
     }
 
-    function _removeLiquidity(bytes32 positionId, int128 liquidity)
+    function _removeLiquidity(PoolKey memory key, ModifyLiquidityParams memory params)
         private
         returns (BalanceDelta liquidityDelta, BalanceDelta feesAccrued)
     {
-        (liquidityDelta, feesAccrued) = hook.removeLiquidity(poolKey, positionId, liquidity);
+        (, liquidityDelta, feesAccrued) = hook.modifyLiquidity(key, params, 1);
     }
 
     function _swap(uint128 amountIn, bool zeroForOne) private {

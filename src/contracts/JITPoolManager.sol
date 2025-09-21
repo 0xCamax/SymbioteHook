@@ -2,20 +2,12 @@
 pragma solidity ^0.8.0;
 
 import {Pool, Slot0} from "@uniswap/v4-core/src/libraries/Pool.sol";
-import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
-import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
-import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {IJITPoolManager} from "../interfaces/IJITPoolManager.sol";
-import {ProtocolFees} from "@uniswap/v4-core/src/ProtocolFees.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {BalanceDelta, BalanceDeltaLibrary, toBalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {CurrencyDelta} from "@uniswap/v4-core/src/libraries/CurrencyDelta.sol";
-import {CurrencyReserves} from "@uniswap/v4-core/src/libraries/CurrencyReserves.sol";
-import {Extsload} from "@uniswap/v4-core/src/Extsload.sol";
-import {Exttload} from "@uniswap/v4-core/src/Exttload.sol";
-import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
+import {BalanceDelta, toBalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {IERC20} from "@oz/contracts/token/ERC20/IERC20.sol";
 import {IWETH9} from "../interfaces/IWETH9.sol";
 import {AaveHelper, IPool, ModifyLiquidityAave, SwapParamsAave, PoolMetrics} from "../libraries/AaveHelper.sol";
@@ -24,755 +16,433 @@ import {ActiveLiquidityLibrary} from "../libraries/ActiveLiquidity.sol";
 import {TransientStateLibrary} from "@uniswap/v4-core/src/libraries/TransientStateLibrary.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Position} from "@uniswap/v4-core/src/libraries/Position.sol";
-import {LiquidityMath} from "../libraries/LiquidityMath.sol";
 import {SafeCallback} from "@uniswap/v4-periphery/src/base/SafeCallback.sol";
-import {LiquidityAmounts} from "../libraries/LiquidityAmounts.sol";
+import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
+import {JITLib} from "../libraries/JITLib.sol";
 
-/**
- * @notice Information about a specific liquidity position
- * @dev Tracks ownership and parameters of user positions
- */
+/// @notice Stores basic information about a user’s position
 struct PositionInfo {
-    /// @notice The address that owns this position
+    /// @notice Owner of the position
     address owner;
-    /// @notice The lower tick of the position range
+    /// @notice Lower tick boundary of the position
     int24 tickLower;
-    /// @notice The upper tick of the position range
+    /// @notice Upper tick boundary of the position
     int24 tickUpper;
-    /// @notice The amount of liquidity in the position
+    /// @notice The amount of liquidity in this position
     uint128 liquidity;
 }
 
-/**
- * @notice Parameters for modifying liquidity within a window
- * @dev Used to specify how liquidity should be added or removed from windows
- */
-struct ModifyLiquidityWindow {
-    /// @notice The lower tick offset relative to the active window
-    int24 rangeLower;
-    /// @notice The upper tick offset relative to the active window
-    int24 rangeUpper;
-    /// @notice The amount of liquidity to add (positive) or remove (negative)
-    int128 liquidityDelta;
-    uint16 leverage;
-    /// @notice Salt for creating unique position identifiers
-    bytes32 salt;
+/// @notice Represents a liquidity window within a tick range
+/// @dev Windows are used to manage concentrated liquidity across specific tick ranges
+struct Window {
+    /// @notice The lower tick boundary of the window
+    int24 tickLower;
+    /// @notice The upper tick boundary of the window
+    int24 tickUpper;
+    /// @notice The amount of liquidity in this window
+    uint128 liquidity;
+    /// @notice Whether this window has been initialized
+    bool initialized;
 }
 
-/**
- * @title JIT Pool Manager
- * @notice Abstract contract that manages Just-In-Time (JIT) liquidity provision with Aave integration
- * @dev Extends Uniswap V4 functionality with leveraged liquidity provision through Aave lending protocol
- * @dev This contract holds state for all managed pools and provides JIT liquidity mechanisms
- *
- * Key Features:
- * - JIT liquidity provision with automatic window management
- * - Integration with Aave lending protocol for leveraged positions
- * - Window-based liquidity distribution for efficient capital allocation
- * - Automated synchronization with Uniswap V4 pool states
- *
- * @author Protocol Team
- * @custom:security-contact security@protocol.com
- */
-abstract contract JITPoolManager is ProtocolFees, Extsload, Exttload, IJITPoolManager, SafeCallback {
-    using SafeCast for *;
-    using Pool for *;
-    using LPFeeLibrary for uint24;
-    using CustomRevert for bytes4;
+/// @title JITPoolManager
+/// @notice Manages concentrated liquidity with Just-In-Time (JIT) provisioning and integrates Aave for lending/borrowing
+/// @dev Uses SafeCallback to ensure safe re-entrancy during liquidity operations
+contract JITPoolManager is IJITPoolManager, SafeCallback {
+    using Pool for Pool.State;
+    using JITLib for Pool.State;
     using AaveHelper for IPool;
     using TickMath for uint160;
     using TickMath for int24;
     using TransientStateLibrary for IPoolManager;
     using StateLibrary for IPoolManager;
-    using LiquidityMath for int128;
 
-    /// @notice Maximum allowed tick spacing
-    int24 private constant MAX_TICK_SPACING = TickMath.MAX_TICK_SPACING;
-
-    /// @notice Minimum allowed tick spacing
-    int24 private constant MIN_TICK_SPACING = TickMath.MIN_TICK_SPACING;
-
-    /// @notice The Aave lending pool contract
     IPool internal immutable aavePool;
-
-    /// @notice The WETH9 contract for handling ETH operations
     IWETH9 internal immutable WETH;
+    address internal owner;
 
-    /// @notice Reference tick for each pool, used as anchor for window calculations
-    mapping(PoolId => int24) internal refTick;
-
-    /// @notice Liquidity windows for each pool, organized by tick positions
+    /// @notice Mapping from PoolId => tickLower => Window
     mapping(PoolId => mapping(int24 => Window)) public windows;
 
-    /// @notice Internal pool states mirroring Uniswap V4 pools
+    /// @notice Stores the state of each Uniswap v4 pool
     mapping(PoolId id => Pool.State) internal _pools;
 
-    /// @notice Position information mapped by pool ID and position hash
+    /// @notice Stores information about positions
     mapping(PoolId => mapping(bytes32 => PositionInfo)) public positionInfo;
 
-    /**
-     * @notice Initializes the JIT Pool Manager
-     * @param initialOwner The initial owner of the contract (for ProtocolFees)
-     * @param _poolManager Address of the Uniswap V4 Pool Manager
-     * @param _WETH Address of the WETH9 contract
-     * @param _aavePool Address of the Aave lending pool
-     */
-    constructor(address initialOwner, address _poolManager, address _WETH, address _aavePool)
-        ProtocolFees(initialOwner)
-        SafeCallback(IPoolManager(_poolManager))
-    {
-        WETH = IWETH9(_WETH);
-        aavePool = IPool(_aavePool);
+    /// @notice Mapping from PoolId => tickSpacing for that pool
+    mapping(PoolId => int24) internal poolSpacing;
+
+    /// @notice Authorization modifier for owner or contract itself
+    modifier auth() {
+        require(msg.sender == owner || msg.sender == address(this));
+        _;
     }
 
-    /**
-     * @notice Modifies JIT liquidity by adding or removing from active windows
-     * @dev This is the core JIT mechanism that manages liquidity across windows
-     * @param key The pool key identifying the target pool
-     * @param zeroForOne Direction of potential swap (affects window selection)
-     * @param add Whether to add (true) or remove (false) liquidity
-     */
+    /// @param o Owner address
+    /// @param pm PoolManager address
+    /// @param w WETH address
+    /// @param ap Aave pool address
+    constructor(address o, address pm, address w, address ap) SafeCallback(IPoolManager(pm)) {
+        owner = o;
+        WETH = IWETH9(w);
+        aavePool = IPool(ap);
+    }
+
+    /// @notice Internal function to perform JIT liquidity modification
+    /// @param key The PoolKey identifying the pool
+    /// @param zeroForOne Direction of swap
+    /// @param add Whether to add or remove liquidity
     function _jitModifyLiquidity(PoolKey memory key, bool zeroForOne, bool add) internal {
-        Window[2] memory _windows = getActiveWindows(key, zeroForOne);
+        PoolId id = key.toId();
+        Pool.State storage pool = _getPool(id);
 
-        // Ensure pool state is synchronized before adding liquidity
-        if (add) {
-            _checkSlot0Sync(key.toId());
-        }
+        // Compute the active window and its liquidity
+        Window memory window = pool.getJITWindow(key.tickSpacing, zeroForOne);
 
-        // Calculate total liquidity across both active windows
-        uint128 totalLiquidity = _windows[0].liquidity + _windows[1].liquidity;
+        if (add) _checkSlot0Sync(id);
 
         // Modify liquidity in the pool manager
         poolManager.modifyLiquidity(
             key,
             ModifyLiquidityParams(
-                zeroForOne ? _windows[1].tickLower : _windows[0].tickLower,
-                zeroForOne ? _windows[0].tickUpper : _windows[1].tickUpper,
-                add ? totalLiquidity.toInt128() : -(totalLiquidity.toInt128()),
+                window.tickLower,
+                window.tickUpper,
+                add ? int128(window.liquidity) : -int128(window.liquidity),
                 bytes32(0)
             ),
             ""
         );
 
+        // Track active liquidity for next JIT operation
         if (add) {
-            // Set active references for tracking
-            ActiveLiquidityLibrary.setRefs(_windows[0].tickLower, _windows[1].tickLower);
+            ActiveLiquidityLibrary.set(window.tickLower, window.tickUpper, window.liquidity);
         } else {
-            // Synchronize state and resolve JIT position
-            _syncPoolState(key.toId());
+            _syncPoolState(id);
             _resolveJIT(key);
-            ActiveLiquidityLibrary.toggleActive();
+            ActiveLiquidityLibrary.toggle();
         }
     }
 
-    /**
-     * @notice Verifies that internal pool state is synchronized with Pool Manager
-     * @dev Critical for ensuring JIT operations work with accurate price data
-     * @param id The pool ID to check
-     */
+    /// @notice Retrieves current Aave pool metrics
+    /// @return PoolMetrics including health factor, utilization, and other position data
+    function getPositionData() public view returns (PoolMetrics memory) {
+        return aavePool.getPoolMetrics();
+    }
+
+    /// @notice Ensures pool slot0 is synchronized with PoolManager
     function _checkSlot0Sync(PoolId id) internal view {
         Slot0 slot0 = _getPool(id).slot0;
         (uint160 pmSqrtPrice, int24 pmTick,,) = poolManager.getSlot0(id);
-
-        require(slot0.sqrtPriceX96() == pmSqrtPrice && slot0.tick() == pmTick, "Not synced");
+        require(slot0.sqrtPriceX96() == pmSqrtPrice && slot0.tick() == pmTick);
     }
 
-    /**
-     * @notice Synchronizes internal pool state with the Pool Manager
-     * @dev Updates price, tick, fee, and fee growth data
-     * @param id The pool ID to synchronize
-     */
+    /// @notice Synchronizes pool state with PoolManager data
     function _syncPoolState(PoolId id) internal {
         Pool.State storage pool = _pools[id];
-
         (uint160 sqrtPrice,,, uint24 fee) = poolManager.getSlot0(id);
         (uint256 feeGrowth0, uint256 feeGrowth1) = poolManager.getFeeGrowthGlobals(id);
-
         pool.slot0 = _pools[id].slot0.setSqrtPriceX96(sqrtPrice).setTick(sqrtPrice.getTickAtSqrtPrice()).setLpFee(fee);
         pool.feeGrowthGlobal0X128 = feeGrowth0;
         pool.feeGrowthGlobal1X128 = feeGrowth1;
     }
 
-    /**
-     * @notice Initializes a new pool with the given parameters
-     * @dev Sets up initial pool state and validates parameters
-     * @param key The pool key containing currencies, fee, tick spacing, and hooks
-     * @param sqrtPriceX96 The initial square root price (encoded as Q64.96)
-     * @return tick The initial tick corresponding to the given price
-     */
-    function initialize(PoolKey memory key, uint160 sqrtPriceX96) internal returns (int24 tick) {
-        // Validate tick spacing bounds
-        if (key.tickSpacing > MAX_TICK_SPACING) TickSpacingTooLarge.selector.revertWith(key.tickSpacing);
-        if (key.tickSpacing < MIN_TICK_SPACING) TickSpacingTooSmall.selector.revertWith(key.tickSpacing);
-
-        // Validate currency ordering
-        if (key.currency0 >= key.currency1) {
-            CurrenciesOutOfOrderOrEqual.selector.revertWith(
-                Currency.unwrap(key.currency0), Currency.unwrap(key.currency1)
-            );
-        }
-
-        uint24 lpFee = key.fee.getInitialLPFee();
+    /// @notice Initializes a new pool
+    /// @param key PoolKey
+    /// @param sqrtPriceX96 Initial sqrt price
+    /// @return tick Initial tick
+    function initialize(PoolKey memory key, uint160 sqrtPriceX96) public auth returns (int24 tick) {
+        uint24 lpFee = key.fee;
         PoolId id = key.toId();
         Pool.State storage pool = _getPool(id);
-
-        // Initialize the pool and get the tick
         tick = pool.initialize(sqrtPriceX96, lpFee);
-        refTick[id] = tick;
-
-        // Emit initialization event with full pool details
-        emit Initialize(
-            id, key.currency0, key.currency1, key.fee, key.tickSpacing, address(key.hooks), sqrtPriceX96, tick
-        );
+        poolManager.initialize(key, sqrtPriceX96);
+        poolSpacing[id] = key.tickSpacing;
     }
 
-    /**
-     * @notice Adds liquidity to a specific window range
-     * @dev Only callable by the contract owner
-     * @param key The pool key identifying the target pool
-     * @param params Parameters specifying the range and amount of liquidity to add
-     * @return positionId The unique identifier for the created position
-     * @return principalDelta The change in token balances from the principal
-     * @return feesAccrued The fees accrued to the position
-     */
-    function addLiquidity(PoolKey memory key, ModifyLiquidityWindow memory params)
+    function modifyLiquidity(PoolKey memory key, ModifyLiquidityParams memory params, uint16 multiplier)
         external
         payable
-        onlyOwner
+        auth
         returns (bytes32 positionId, BalanceDelta principalDelta, BalanceDelta feesAccrued)
     {
-        require(params.rangeLower <= params.rangeUpper, "Invalid lower range");
-        require(params.liquidityDelta >= 0, "Invalid liquidity");
-        require(params.leverage >= 1000 && params.leverage <= getMaxLeverage(key), "Invalid leverage");
+        int128 totalLiquidity = int128(params.liquidityDelta * int16(multiplier));
+        int24 nWindows = (params.tickUpper - params.tickLower) / key.tickSpacing;
+        if (nWindows < 0) nWindows = -nWindows;
 
-        int128 liquidity = params.liquidityDelta.mulLeverage(params.leverage).toInt128();
+        int128 liquidityPerWindow = totalLiquidity / nWindows;
+        int128 remainder = totalLiquidity % nWindows;
 
-        // Calculate absolute tick positions based on active window
-        Window memory activeWindow = getActiveWindows(key, true)[0];
-        int24 tickLower = activeWindow.tickLower + (params.rangeLower * key.tickSpacing);
-        int24 tickUpper = activeWindow.tickUpper + (params.rangeUpper * key.tickSpacing);
+        positionId = Position.calculatePositionKey(msg.sender, params.tickLower, params.tickUpper, bytes32(0));
 
-        // Execute the liquidity modification
-        (positionId, principalDelta, feesAccrued) = _modifyLiquidity(
-            key,
-            ModifyLiquidityParams({
-                tickLower: tickLower,
-                tickUpper: tickUpper,
-                liquidityDelta: liquidity,
-                salt: bytes32(0)
-            }),
-            params.liquidityDelta
+        for (int24 i = 0; i < nWindows; i++) {
+            int24 lower = params.tickLower + key.tickSpacing * i;
+            if (i == nWindows - 1) liquidityPerWindow += remainder;
+
+            ModifyLiquidityParams memory p = ModifyLiquidityParams({
+                tickLower: lower,
+                tickUpper: lower + key.tickSpacing,
+                liquidityDelta: liquidityPerWindow,
+                salt: params.salt
+            });
+
+            (BalanceDelta pd, BalanceDelta fa) = _modifyLiquidity(key, p);
+            principalDelta = principalDelta + pd;
+            feesAccrued = feesAccrued + fa;
+        }
+
+        positionId = Position.calculatePositionKey(msg.sender, params.tickLower, params.tickUpper, bytes32(0));
+        positionInfo[key.toId()][positionId] = PositionInfo(
+            msg.sender,
+            params.tickLower,
+            params.tickUpper,
+            uint128(int128(positionInfo[key.toId()][positionId].liquidity) + totalLiquidity)
         );
 
-        // Update position information
-        PositionInfo storage _info = positionInfo[key.toId()][positionId];
-        positionInfo[key.toId()][positionId] = PositionInfo({
-            owner: msg.sender,
-            tickLower: tickLower,
-            tickUpper: tickUpper,
-            liquidity: _info.liquidity + liquidity.toUint128()
-        });
+        _resolveModifyLiquidity(key, principalDelta + feesAccrued, multiplier);
 
-        // Enable tokens as collateral in Aave if needed
-        if (principalDelta.amount0() < 0) {
-            aavePool.setUserUseReserveAsCollateral(
-                key.currency0.isAddressZero() ? address(WETH) : Currency.unwrap(key.currency0), true
-            );
-        }
-        if (principalDelta.amount1() < 0) {
-            aavePool.setUserUseReserveAsCollateral(Currency.unwrap(key.currency1), true);
-        }
+        emit ModifyLiquidity(positionId, msg.sender, params.tickLower, params.tickUpper, totalLiquidity, params.salt);
     }
 
-    /**
-     * @notice Removes liquidity from a specific position
-     * @dev Only callable by the position owner
-     * @param key The pool key identifying the target pool
-     * @param positionId The unique identifier of the position to modify
-     * @param liquidity The amount of liquidity to remove (must be negative)
-     * @return liquidityDelta The change in token balances from liquidity removal
-     * @return feesAccrued The fees collected from the position
-     */
-    function removeLiquidity(PoolKey memory key, bytes32 positionId, int128 liquidity)
-        external
-        onlyOwner
-        returns (BalanceDelta liquidityDelta, BalanceDelta feesAccrued)
-    {
-        require(liquidity <= 0, "Invalid liquidity");
-
-        PositionInfo storage _info = positionInfo[key.toId()][positionId];
-
-        // Execute the liquidity removal
-        (, liquidityDelta, feesAccrued) = _modifyLiquidity(
-            key,
-            ModifyLiquidityParams({
-                tickLower: _info.tickLower,
-                tickUpper: _info.tickUpper,
-                liquidityDelta: liquidity,
-                salt: bytes32(0)
-            }),
-            liquidity
-        );
-
-        // Update position liquidity tracking
-        _info.liquidity -= (-liquidity).toUint128();
-    }
-
-    /**
-     * @notice Internal function to modify liquidity in a position
-     * @dev Core logic for adding/removing liquidity with proper accounting
-     * @param key The pool key identifying the target pool
-     * @param params The parameters for the liquidity modification
-     * @return positionId The unique identifier for the position
-     * @return principalDelta The change in token balances from the principal
-     * @return feesAccrued The fees accrued to the position
-     */
-    function _modifyLiquidity(PoolKey memory key, ModifyLiquidityParams memory params, int128 baseLiquidity)
+    /// @notice Modify liquidity in the pool
+    function _modifyLiquidity(PoolKey memory key, ModifyLiquidityParams memory params)
         internal
-        returns (bytes32 positionId, BalanceDelta principalDelta, BalanceDelta feesAccrued)
+        returns (BalanceDelta principalDelta, BalanceDelta feesAccrued)
     {
-        BalanceDelta callerDelta;
+        PoolId id = key.toId();
         {
-            Pool.State storage pool = _getPool(key.toId());
+            Pool.State storage pool = _getPool(id);
             pool.checkPoolInitialized();
 
-            // Execute the liquidity modification in the pool
             (principalDelta, feesAccrued) = pool.modifyLiquidity(
                 Pool.ModifyLiquidityParams({
                     owner: msg.sender,
                     tickLower: params.tickLower,
                     tickUpper: params.tickUpper,
-                    liquidityDelta: params.liquidityDelta.toInt128(),
+                    liquidityDelta: int128(params.liquidityDelta),
                     tickSpacing: key.tickSpacing,
                     salt: params.salt
                 })
             );
-
-            // Combine principal and fee deltas for the caller
-            callerDelta = principalDelta + feesAccrued;
-        }
-
-        // Calculate position identifier
-        positionId = Position.calculatePositionKey(msg.sender, params.tickLower, params.tickUpper, bytes32(0));
-
-        // Handle token transfers and Aave interactions
-        _resolveModifyLiquidity(
-            key,
-            callerDelta,
-            Window(
-                params.tickLower,
-                params.tickUpper,
-                baseLiquidity > 0 ? baseLiquidity.toUint128() : 0,
-                baseLiquidity != params.liquidityDelta.toInt128()
-            )
-        );
-
-        // Distribute liquidity across the specified windows
-        _distributeLiquidityAcrossWindows(key, params.tickLower, params.tickUpper, params.liquidityDelta);
-
-        // Emit event for tracking
-        emit ModifyLiquidity(
-            positionId, msg.sender, params.tickLower, params.tickUpper, params.liquidityDelta, params.salt
-        );
-    }
-
-    /**
-     * @notice Distributes liquidity across multiple windows within a tick range
-     * @dev Automatically initializes windows if they don't exist and distributes liquidity evenly
-     * @param key The pool key identifying the target pool
-     * @param tickLower The lower bound of the range
-     * @param tickUpper The upper bound of the range
-     * @param liquidityDelta The amount of liquidity to distribute (positive) or remove (negative)
-     */
-    function _distributeLiquidityAcrossWindows(
-        PoolKey memory key,
-        int24 tickLower,
-        int24 tickUpper,
-        int256 liquidityDelta
-    ) internal {
-        // Calculate number of windows in the range
-        uint256 nWindows = ((tickUpper - tickLower) / key.tickSpacing).toUint128();
-        nWindows += 1;
-        uint256 absDelta =
-            liquidityDelta >= 0 ? liquidityDelta.toInt128().toUint128() : (-liquidityDelta).toInt128().toUint128();
-
-        // Distribute liquidity across each window
-        for (uint256 i = 0; i < nWindows; ++i) {
-            int24 wLower = tickLower + int24(int256(i) * key.tickSpacing);
-
-            // Initialize window if needed
-            Window storage w = windows[key.toId()][wLower];
-            if (!w.initilized) {
-                w.tickLower = wLower;
-                w.tickUpper = wLower + key.tickSpacing;
-                w.liquidity = 0;
-                w.initilized = true;
-            }
-
-            // Calculate liquidity assignment with even distribution and remainder handling
-            uint128 assign = uint128((absDelta / nWindows) + (i < (absDelta % nWindows) ? 1 : 0));
-
-            // Update window liquidity
-            if (liquidityDelta >= 0) {
-                unchecked {
-                    w.liquidity += assign;
-                }
-            } else {
-                require(w.liquidity >= assign, "window liquidity insufficient");
-                unchecked {
-                    w.liquidity -= assign;
-                }
-            }
         }
     }
 
-    /**
-     * @notice Resolves token settlements for liquidity modifications
-     * @dev Handles token transfers, WETH wrapping/unwrapping, and Aave interactions
-     * @param deltas The balance changes that need to be settled
-     * @param key The pool key for the relevant pool
-     */
-    function _resolveModifyLiquidity(PoolKey memory key, BalanceDelta deltas, Window memory baseLiquidity) internal {
-        int128 delta0 = deltas.amount0();
-        int128 delta1 = deltas.amount1();
-        address asset0 = key.currency0.isAddressZero() ? address(WETH) : Currency.unwrap(key.currency0);
-        address asset1 = Currency.unwrap(key.currency1);
+    /// @notice Resolves liquidity changes and interacts with Aave if necessary
+    function _resolveModifyLiquidity(PoolKey memory key, BalanceDelta deltas, uint16 multiplier) internal {
+        (address a0, address a1, int128 d0, int128 d1) = _get(key, deltas);
+        uint256 b0 = aavePool.getATokenBalance(a0, address(this));
+        uint256 b1 = aavePool.getATokenBalance(a1, address(this));
 
-        // Check available balances in Aave
-        uint256 balance0 = aavePool.getATokenBalance(asset0, address(this));
-        uint256 balance1 = aavePool.getATokenBalance(asset1, address(this));
-
-        // Cap deltas to available balances if insufficient
-        if ((int256(balance0) < delta0 && delta0 > 0) || (int256(balance1) < delta1 && delta1 > 0)) {
-            deltas = toBalanceDelta(int128(int256(balance0)), int128(int256(balance1)));
+        if ((int256(b0) < d0 && d0 > 0) || (int256(b1) < d1 && d1 > 0)) {
+            deltas = toBalanceDelta(int128(int256(b0)), int128(int256(b1)));
         }
 
-        if (!baseLiquidity.initilized) {
-            if (delta0 < 0) {
+        if (multiplier == 1) {
+            if (d0 < 0) {
                 if (key.currency0.isAddressZero()) {
-                    require(msg.value >= (-delta0).toUint128(), "Insufficient amount0");
-                    WETH.deposit{value: (-delta0).toUint128()}();
-                    payable(msg.sender).transfer(address(this).balance);
+                    require(msg.value >= uint128(-d0));
+                    WETH.deposit{value: msg.value}();
                 } else {
-                    IERC20(Currency.unwrap(key.currency0)).transferFrom(
-                        msg.sender, address(this), (-delta0).toUint128()
-                    );
+                    IERC20(Currency.unwrap(key.currency0)).transferFrom(msg.sender, address(this), uint128(-d0));
                 }
             }
-            // Handle token1 requirements
-            if (delta1 < 0) {
-                IERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender, address(this), (-delta1).toUint128());
+            if (d1 < 0) {
+                IERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender, address(this), uint128(-d1));
             }
-
-            aavePool.modifyLiquidity(ModifyLiquidityAave(msg.sender, asset0, asset1, deltas));
+            aavePool.modifyLiquidity(ModifyLiquidityAave(msg.sender, a0, a1, deltas));
         } else {
-            _flash(key, deltas, baseLiquidity);
+            _flash(key, deltas, multiplier);
         }
-
-        // Sweep any remaining tokens back to the caller
         _sweep(key);
     }
 
-    function _flash(PoolKey memory key, BalanceDelta deltas, Window memory baseLiquidity) internal {
-        bytes memory data = abi.encode(msg.sender, key, deltas, baseLiquidity);
-        poolManager.unlock(data);
+    /// @notice Performs flash-like JIT operations
+    function _flash(PoolKey memory key, BalanceDelta deltas, uint16 multiplier) internal {
+        poolManager.unlock(abi.encode(msg.sender, key, deltas, multiplier));
     }
 
-    function _unlockCallback(bytes calldata data) internal override returns (bytes memory) {
-        (address user, PoolKey memory key, BalanceDelta deltas, Window memory baseLiquidity) =
-            abi.decode(data, (address, PoolKey, BalanceDelta, Window));
-
-        address asset0 = key.currency0.isAddressZero() ? address(WETH) : Currency.unwrap(key.currency0);
-        address asset1 = Currency.unwrap(key.currency1);
-
-        int128 delta0 = -(deltas.amount0());
-        int128 delta1 = -(deltas.amount1());
-
-        Slot0 slot0 = _getPool(key.toId()).slot0;
-
-        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(
-            slot0.sqrtPriceX96(),
-            baseLiquidity.tickLower.getSqrtPriceAtTick(),
-            baseLiquidity.tickUpper.getSqrtPriceAtTick(),
-            baseLiquidity.liquidity
-        );
-
-        if (delta0 > 0) {
-            poolManager.take(key.currency0, address(this), delta0.toUint128());
-        }
-        if (delta1 > 0) {
-            poolManager.take(key.currency1, address(this), delta1.toUint128());
-        }
-
-        aavePool.modifyLiquidity(ModifyLiquidityAave(address(this), asset0, asset1, deltas));
-
-        _settle(key.currency0, user, amount0);
-        _settle(key.currency1, user, amount1);
-
-        delta0 = poolManager.currencyDelta(address(this), key.currency0).toInt128();
-        delta1 = poolManager.currencyDelta(address(this), key.currency1).toInt128();
-
-        if (delta0 < 0) {
-            _borrow(asset0, (-delta0).toUint128());
-            _settle(key.currency0, address(this), (-delta0).toUint128());
-        }
-        if (delta1 < 0) {
-            _borrow(asset1, (-delta1).toUint128());
-            _settle(key.currency1, address(this), (-delta1).toUint128());
-        }
-
-        return data;
-    }
-
-    function _settle(Currency currency, address from, uint256 amount) internal {
+    /// @notice Settles asset amounts with pool manager
+    function _settle(Currency currency, address from, int256 amount) internal {
+        uint256 _amount = uint256(-amount);
         if (currency.isAddressZero()) {
-            if (address(this).balance < amount) {
-                require(WETH.balanceOf(address(this)) >= amount, "Insufficient ETH");
-                WETH.withdraw(amount);
+            if (address(this).balance < _amount) {
+                require(WETH.balanceOf(address(this)) >= _amount);
+                WETH.withdraw(_amount);
             }
-            poolManager.settle{value: amount}();
+            poolManager.settle{value: _amount}();
         } else {
             address token = Currency.unwrap(currency);
             poolManager.sync(currency);
             from == address(this)
-                ? IERC20(token).transfer(address(poolManager), amount)
-                : IERC20(token).transferFrom(from, address(poolManager), amount);
+                ? IERC20(token).transfer(address(poolManager), _amount)
+                : IERC20(token).transferFrom(from, address(poolManager), _amount);
             poolManager.settle();
         }
     }
 
-    /**
-     * @notice Sweeps any remaining token balances back to the caller
-     * @dev Safety mechanism to ensure no tokens are left in the contract
-     * @param key The pool key to identify which tokens to sweep
-     */
+    /// @notice Borrows assets from Aave pool
+    function borrow(address asset, uint256 amount) public auth {
+        aavePool.borrow(asset, amount, 2, 0, address(this));
+    }
+
+    /// @notice Repays debt to Aave
+    function repay(address asset, uint256 amount, bool max) public auth {
+        aavePool.repay(asset, max ? type(uint256).max : amount, 2, address(this));
+    }
+
+    /// @notice Repays using aTokens directly
+    function repayWithATokens(address asset, uint256 amount, bool max) public auth returns (uint256) {
+        return aavePool.repayWithATokens(asset, max ? type(uint256).max : amount, 2);
+    }
+
+    /// @notice Sweeps leftover tokens back to the caller
     function _sweep(PoolKey memory key) internal {
-        address[] memory tokens = new address[](2);
-        tokens[0] = key.currency0.isAddressZero() ? address(WETH) : Currency.unwrap(key.currency0);
-        tokens[1] = Currency.unwrap(key.currency1);
-
-        for (uint256 i = 0; i < tokens.length; ++i) {
-            uint256 bal = IERC20(tokens[i]).balanceOf(address(this));
-            if (bal > 0) {
-                IERC20(tokens[i]).transfer(msg.sender, bal);
-            }
-        }
+        (address t0, address t1,,) = _get(key, toBalanceDelta(0, 0));
+        uint256 b0 = IERC20(t0).balanceOf(address(this));
+        if (b0 > 0) IERC20(t0).transfer(msg.sender, b0);
+        uint256 b1 = IERC20(t1).balanceOf(address(this));
+        if (b1 > 0) IERC20(t1).transfer(msg.sender, b1);
     }
 
-    /**
-     * @notice Resolves JIT position settlements with the Pool Manager
-     * @dev Handles token settlements after JIT liquidity operations
-     * @param key The pool key for the relevant pool
-     */
+    /// @notice Resolves JIT swap and liquidity interactions
     function _resolveJIT(PoolKey memory key) internal {
-        // Get currency deltas from pool manager
-        int128 delta0 = poolManager.currencyDelta(address(this), key.currency0).toInt128();
-        int128 delta1 = poolManager.currencyDelta(address(this), key.currency1).toInt128();
-        address asset0 = key.currency0.isAddressZero() ? address(WETH) : Currency.unwrap(key.currency0);
-        address asset1 = Currency.unwrap(key.currency1);
+        int128 d0 = int128(poolManager.currencyDelta(address(this), key.currency0));
+        int128 d1 = int128(poolManager.currencyDelta(address(this), key.currency1));
+        address a0 = key.currency0.isAddressZero() ? address(WETH) : Currency.unwrap(key.currency0);
+        address a1 = Currency.unwrap(key.currency1);
 
-        // Take tokens from pool manager if owed to us
-        if (delta0 > 0) {
-            poolManager.take(key.currency0, address(this), delta0.toUint128());
-        }
-        if (delta1 > 0) {
-            poolManager.take(key.currency1, address(this), delta1.toUint128());
-        }
+        if (d0 > 0) poolManager.take(key.currency0, address(this), uint128(d0));
+        if (d1 > 0) poolManager.take(key.currency1, address(this), uint128(d1));
 
-        // Process swap through Aave
-        aavePool.swap(SwapParamsAave(asset0, asset1, toBalanceDelta(delta0, delta1)));
+        aavePool.swap(SwapParamsAave(a0, a1, toBalanceDelta(d0, d1)));
 
-        // Settle any debts to the pool manager
-        if (delta0 < 0) {
-            _settle(key.currency0, address(this), (-delta0).toUint128());
-        }
-        if (delta1 < 0) {
-            _settle(key.currency1, address(this), (-delta1).toUint128());
-        }
+        if (d0 < 0) _settle(key.currency0, address(this), d0);
+        if (d1 < 0) _settle(key.currency1, address(this), d1);
     }
 
-    /**
-     * @notice Returns the swap fee for a given pool
-     * @dev Virtual function that can be overridden for dynamic fee logic
-     * @param key The pool key
-     * @return The swap fee for the pool
-     */
-    function _swapFee(PoolKey memory key) internal virtual returns (uint24) {
-        return key.fee;
-    }
-
-    /**
-     * @notice Gets the pool state for a given pool ID
-     * @dev Internal function required by the Pool library
-     * @param id The pool ID
-     * @return The pool state storage reference
-     */
-    function _getPool(PoolId id) internal view override returns (Pool.State storage) {
+    /// @notice Internal getter for pool state
+    function _getPool(PoolId id) internal view returns (Pool.State storage) {
         return _pools[id];
     }
 
-    /**
-     * @notice Calculates the maximum leverage available for a pool
-     * @dev Based on the minimum safe leverage between the two pool assets in Aave
-     * @param key The pool key identifying the assets
-     * @return maxLeverage The maximum leverage scaled by 1000 (e.g., 2500 = 2.5x leverage)
-     */
-    function getMaxLeverage(PoolKey memory key) public view returns (uint16 maxLeverage) {
-        address asset0 = key.currency0.isAddressZero() ? address(WETH) : Currency.unwrap(key.currency0);
-        address asset1 = Currency.unwrap(key.currency1);
-
-        uint256 l0 = aavePool.safeLeverage(asset0);
-        uint256 l1 = aavePool.safeLeverage(asset1);
-
-        // Select the more conservative (minimum) leverage
-        uint256 minLeverage = l0 > l1 ? l1 : l0;
-
-        // Convert from 1e18 scale to ×1000 scale
-        maxLeverage = uint16((minLeverage * 1000) / 1e18);
-    }
-
-    /**
-     * @notice Gets current position metrics from Aave
-     * @dev Provides health factor, utilization, and other position data
-     * @return Pool metrics including health factor and utilization rates
-     */
-    function getPositionData() public view returns (PoolMetrics memory) {
-        return aavePool.getPoolMetrics();
-    }
-
-    /**
-     * @notice Gets the current state of a specific pool
-     * @dev Returns key pool state information including price, liquidity, and fees
-     * @param id The pool ID to query
-     * @return slot0 Current price and tick information
-     * @return feeGrowthGlobal0X128 Accumulated fees for token0
-     * @return feeGrowthGlobal1X128 Accumulated fees for token1
-     * @return liquidity Current active liquidity in the pool
-     */
+    /// @notice Returns pool state metrics
     function getPoolState(PoolId id)
         public
         view
         returns (Slot0 slot0, uint256 feeGrowthGlobal0X128, uint256 feeGrowthGlobal1X128, uint128 liquidity)
     {
-        Pool.State storage pool = _pools[id];
-
+        Pool.State storage pool = _getPool(id);
         slot0 = pool.slot0;
         liquidity = pool.liquidity;
         feeGrowthGlobal0X128 = pool.feeGrowthGlobal0X128;
         feeGrowthGlobal1X128 = pool.feeGrowthGlobal1X128;
     }
 
-    /**
-     * @notice Gets the two active windows for JIT liquidity operations
-     * @dev Returns the current window and the adjacent window in the swap direction
-     * @param key The pool key identifying the target pool
-     * @param zeroForOne The swap direction (affects which adjacent window is selected)
-     * @return _windows Array containing the active window [0] and adjacent window [1]
-     */
-    function getActiveWindows(PoolKey memory key, bool zeroForOne) public returns (Window[2] memory _windows) {
-        PoolId id = key.toId();
+    /// @notice Returns the currently active window for a pool
+    function getActiveWindow(PoolId id) external view returns (Window memory) {
+        return _getActiveWindow(id);
+    }
+
+    function _getActiveWindow(PoolId id) internal view returns (Window memory) {
         Pool.State storage pool = _getPool(id);
+        int24 spacing = poolSpacing[id];
+        return pool.getActiveWindow(spacing);
+    }
 
-        // Return cached windows if already active
-        if (ActiveLiquidityLibrary.isActive()) {
-            (int24 w0, int24 w1) = ActiveLiquidityLibrary.getRefs();
-            _windows[0] = windows[id][w0];
-            _windows[1] = windows[id][w1];
-            return (_windows);
+    function _get(PoolKey memory key, BalanceDelta deltas)
+        internal
+        view
+        returns (address a0, address a1, int128 d0, int128 d1)
+    {
+        d0 = deltas.amount0();
+        d1 = deltas.amount1();
+        a0 = key.currency0.isAddressZero() ? address(WETH) : Currency.unwrap(key.currency0);
+        a1 = Currency.unwrap(key.currency1);
+    }
+
+    /// @notice Callback handler for flash-like JIT operations
+    function _unlockCallback(bytes calldata data) internal override returns (bytes memory) {
+        (address user, PoolKey memory key, BalanceDelta deltas, uint16 multiplier) =
+            abi.decode(data, (address, PoolKey, BalanceDelta, uint16));
+        (address a0, address a1, int128 d0, int128 d1) = _get(key, deltas);
+
+        int128 userD0 = d0 / int16(multiplier);
+        int128 userD1 = d1 / int16(multiplier);
+
+        if (d0 < 0) poolManager.take(key.currency0, address(this), uint128(-d0));
+        if (d1 < 0) poolManager.take(key.currency1, address(this), uint128(-d1));
+
+        aavePool.modifyLiquidity(ModifyLiquidityAave(address(this), a0, a1, deltas));
+
+        _settle(key.currency0, user, userD0);
+        _settle(key.currency1, user, userD1);
+
+        d0 = int128(poolManager.currencyDelta(address(this), key.currency0));
+        d1 = int128(poolManager.currencyDelta(address(this), key.currency1));
+
+        console2.log(d0);
+        console2.log(d1);
+
+        if (d0 < 0) {
+            aavePool.borrow(a0, uint128(-d0));
+            _settle(key.currency0, address(this), d0);
         }
-
-        // Calculate active window based on current tick
-        int24 currentTick = pool.slot0.tick();
-        int24 ref = refTick[id];
-
-        int24 windowsFromRef = (currentTick - ref) / key.tickSpacing;
-        if ((currentTick - ref) < 0 && (currentTick - ref) % key.tickSpacing != 0) {
-            windowsFromRef -= 1;
+        if (d1 < 0) {
+            aavePool.borrow(a1, uint128(-d1));
+            _settle(key.currency1, address(this), d1);
         }
-        int24 tickLower = ref + windowsFromRef * key.tickSpacing;
+        return data;
+    }
 
-        // Initialize active window if needed
-        Window storage activeWindow = windows[id][tickLower];
-        if (!activeWindow.initilized) {
-            activeWindow.tickLower = tickLower;
-            activeWindow.tickUpper = tickLower + key.tickSpacing;
-            activeWindow.liquidity = 0;
-            activeWindow.initilized = true;
+    /// @notice Computes asset delta for a given window
+    function _getAmountsDelta(PoolId id, Window memory pos) internal view returns (BalanceDelta delta) {
+        (uint160 sqrtPriceX96, int24 tick,,) = poolManager.getSlot0(id);
+        if (tick < pos.tickLower) {
+            delta = toBalanceDelta(
+                int128(
+                    SqrtPriceMath.getAmount0Delta(
+                        TickMath.getSqrtPriceAtTick(pos.tickLower),
+                        TickMath.getSqrtPriceAtTick(pos.tickUpper),
+                        int128(pos.liquidity)
+                    )
+                ),
+                0
+            );
+        } else if (tick < pos.tickUpper) {
+            delta = toBalanceDelta(
+                int128(
+                    SqrtPriceMath.getAmount0Delta(
+                        sqrtPriceX96, TickMath.getSqrtPriceAtTick(pos.tickUpper), int128(pos.liquidity)
+                    )
+                ),
+                int128(
+                    SqrtPriceMath.getAmount1Delta(
+                        TickMath.getSqrtPriceAtTick(pos.tickLower), sqrtPriceX96, int128(pos.liquidity)
+                    )
+                )
+            );
+        } else {
+            delta = toBalanceDelta(
+                0,
+                int128(
+                    SqrtPriceMath.getAmount1Delta(
+                        TickMath.getSqrtPriceAtTick(pos.tickLower),
+                        TickMath.getSqrtPriceAtTick(pos.tickUpper),
+                        int128(pos.liquidity)
+                    )
+                )
+            );
         }
-
-        // Calculate neighbor window position based on swap direction
-        int24 neighborLower = zeroForOne ? tickLower - key.tickSpacing : tickLower + key.tickSpacing;
-
-        // Initialize neighbor window if needed
-        Window storage nextWindow = windows[id][neighborLower];
-        if (!nextWindow.initilized) {
-            nextWindow.tickLower = neighborLower;
-            nextWindow.tickUpper = neighborLower + key.tickSpacing;
-            nextWindow.liquidity = 0;
-            nextWindow.initilized = true;
-        }
-
-        _windows[0] = activeWindow;
-        _windows[1] = nextWindow;
     }
 
-    /**
-     * @notice Borrows assets from Aave lending pool
-     * @dev Only callable by contract owner, uses variable interest rate mode
-     * @param asset The address of the asset to borrow
-     * @param amount The amount to borrow
-     */
-    function borrow(address asset, uint256 amount) public onlyOwner {
-        _borrow(asset, amount);
+    /// @notice Returns amounts for a given liquidity window, negated for settlement
+    function getAmountsForLiquidity(PoolId id, Window memory pos) public view returns (BalanceDelta) {
+        BalanceDelta deltas = _getAmountsDelta(id, pos);
+        return toBalanceDelta(-deltas.amount0(), -deltas.amount1());
     }
 
-    function _borrow(address asset, uint256 amount) internal {
-        aavePool.borrow(asset, amount, 2, 0, address(this));
-    }
-
-    /**
-     * @notice Repays borrowed assets to Aave lending pool
-     * @dev Only callable by contract owner
-     * @param asset The address of the asset to repay
-     * @param amount The amount to repay
-     * @param max Whether to repay the maximum possible amount
-     */
-    function repay(address asset, uint256 amount, bool max) public onlyOwner {
-        _repay(asset, amount, max);
-    }
-
-    function _repay(address asset, uint256 amount, bool max) internal {
-        aavePool.repay(asset, max ? type(uint256).max : amount, 2, address(this));
-    }
-
-    /**
-     * @notice Repays debt using aTokens directly
-     * @dev More gas efficient than withdrawing and repaying separately
-     * @param asset The address of the underlying asset
-     * @param amount The amount to repay with aTokens
-     * @param max Whether to repay the maximum possible amount
-     * @return The actual amount repaid
-     */
-    function repayWithATokens(address asset, uint256 amount, bool max) public onlyOwner returns (uint256) {
-        return _repayWithATokens(asset, amount, max);
-    }
-
-    function _repayWithATokens(address asset, uint256 amount, bool max) internal returns (uint256) {
-        return aavePool.repayWithATokens(asset, max ? type(uint256).max : amount, 2);
-    }
-
-    function _isUnlocked() internal override returns (bool) {
-        return false;
-    }
-
-    /**
-     * @notice Handles ETH deposits and WETH wrapping
-     * @dev Automatically wraps ETH to WETH unless sent from WETH contract
-     */
+    /// @notice Fallback to wrap ETH into WETH
     receive() external payable {
-        if (msg.sender != address(WETH)) {
-            WETH.deposit{value: msg.value}();
-        }
+        if (msg.sender != address(WETH)) WETH.deposit{value: msg.value}();
     }
 }
