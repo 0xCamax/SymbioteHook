@@ -204,7 +204,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
 
         // Verify pool metrics
         PoolMetrics memory metrics = hook.getPositionData();
-        assertGt(metrics.totalCollateralETH, 0, "Should have collateral");
+        assertGt(metrics.totalCollateral, 0, "Should have collateral");
 
         console2.log(" Position created with ID:", vm.toString(positionId));
         console2.log(" Active liquidity:", liquidity);
@@ -221,7 +221,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
 
         // Verify pool metrics
         PoolMetrics memory metrics = hook.getPositionData();
-        assertGt(metrics.totalCollateralETH, 0, "Should have collateral");
+        assertGt(metrics.totalCollateral, 0, "Should have collateral");
 
         _logPoolMetrics(metrics);
     }
@@ -234,7 +234,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         hook.repayWithATokens(address(USDC), 0, true);
 
         PoolMetrics memory metrics = hook.getPositionData();
-        assertGt(metrics.totalCollateralETH, 0, "Should have collateral");
+        assertGt(metrics.totalCollateral, 0, "Should have collateral");
         _logPoolMetrics(metrics);
     }
 
@@ -283,6 +283,13 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         assertGt(usdcPaidByUser + usdcLeverageInferred, 0, "No USDC contribution detected");
     }
 
+    function test_AddRemoveLeverage_Success() public poolInitialized {
+        // execute liquidity addition (returns tick range)
+        (,, int24 tickLower, int24 tickUpper) = _addLiquidity(LIQUIDITY_TO_ADD, 4);
+
+        _removeLiquidity(poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD , bytes32(abi.encode(4))));
+    }
+
     function test_RemoveLiquidity_Success() public poolInitialized {
         // First add liquidity
         (,, int24 tickLower, int24 tickUpper) = _addLiquidity(LIQUIDITY_TO_ADD, 1);
@@ -291,7 +298,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
 
         // Remove liquidity
         (BalanceDelta liquidityDelta,) =
-            _removeLiquidity(poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(0)));
+            _removeLiquidity(poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(abi.encode(1))));
 
         // Verify liquidity was removed
         assertGt(liquidityDelta.amount0(), 0, "Should return ETH");
@@ -425,7 +432,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
 
         // Remove liquidity
         (BalanceDelta liquidityDelta,) =
-            _removeLiquidity(poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(0)));
+            _removeLiquidity(poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(abi.encode(1))));
 
         uint256 finalETH = testAccount.balance + IERC20(address(WETH)).balanceOf(address(this));
         uint256 finalUSDC = USDC.balanceOf(testAccount);
@@ -525,8 +532,8 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         ModifyLiquidityParams memory params = ModifyLiquidityParams({
             tickLower: tickLower,
             tickUpper: tickUpper,
-            liquidityDelta: baseLiquidity * int16(multiplier != 0 ? multiplier : 1),
-            salt: bytes32(0)
+            liquidityDelta: baseLiquidity,
+            salt: bytes32(abi.encode(multiplier))
         });
 
         BalanceDelta amounts = hook.getAmountsForLiquidity(
@@ -535,14 +542,14 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         uint256 ethAmount = uint128(amounts.amount0());
         require(ethAmount <= address(this).balance, "Insufficient ETH for liquidity");
 
-        (positionId,, feesAccrued) = hook.modifyLiquidity{value: ethAmount}(poolKey, params, multiplier);
+        (positionId,, feesAccrued) = hook.modifyLiquidity{value: ethAmount}(poolKey, params);
     }
 
     function _removeLiquidity(PoolKey memory key, ModifyLiquidityParams memory params)
         private
         returns (BalanceDelta liquidityDelta, BalanceDelta feesAccrued)
     {
-        (, liquidityDelta, feesAccrued) = hook.modifyLiquidity(key, params, 1);
+        (, liquidityDelta, feesAccrued) = hook.modifyLiquidity(key, params);
     }
 
     function _swap(uint128 amountIn, bool zeroForOne) private {
@@ -580,9 +587,9 @@ contract SymbioteHookTests is Test, AbritrumConstants {
 
     function _logPoolMetrics(PoolMetrics memory metrics) private pure {
         console2.log("--- Pool Metrics ---");
-        console2.log("Total collateral (ETH):", metrics.totalCollateralETH);
-        console2.log("Total debt (ETH):", metrics.totalDebtETH);
-        console2.log("Available borrows (ETH):", metrics.availableBorrowsETH);
+        console2.log("Total collateral (ETH):", metrics.totalCollateral);
+        console2.log("Total debt (ETH):", metrics.totalDebt);
+        console2.log("Available borrows (ETH):", metrics.availableBorrows);
         console2.log("Liquidation threshold:", metrics.currentLiquidationThreshold);
         console2.log("LTV:", metrics.ltv);
         console2.log("Health factor:", metrics.healthFactor);

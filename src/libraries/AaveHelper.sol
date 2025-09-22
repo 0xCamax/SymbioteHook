@@ -33,20 +33,48 @@ struct AssetData {
 }
 
 struct PoolMetrics {
-    uint256 totalCollateralETH;
-    uint256 totalDebtETH;
-    uint256 availableBorrowsETH;
+    uint256 totalCollateral;
+    uint256 totalDebt;
+    uint256 availableBorrows;
     uint256 currentLiquidationThreshold;
     uint256 ltv;
     uint256 healthFactor;
 }
 
+import {console2} from "forge-std/Test.sol";
+
 library AaveHelper {
     using AaveHelper for IPool;
+
+    uint256 private constant DUST = 1_000;
 
     function _supplyToAave(IPool pool, address asset, uint128 amount) private {
         IERC20(asset).approve(address(pool), amount);
         pool.supply(asset, amount, address(this), 0);
+    }
+
+    function safeWithdraw(IPool pool, address asset, uint128 amount, address to) internal {
+        try pool.withdraw(asset, amount, to) {
+            _handleResidualDebt(pool, asset);
+        } catch {
+            _handleFallbackWithdraw(pool, asset, to);
+        }
+    }
+
+    function _handleResidualDebt(IPool pool, address asset) private {
+        uint256 debt = getVariableDebtBalance(pool, asset);
+        if (debt < DUST && debt != 0) {
+            repay(pool, asset, 0, true);
+        }
+    }
+
+    function _handleFallbackWithdraw(IPool pool, address asset, address to) private {
+        uint256 debt = getVariableDebtBalance(pool, asset);
+        if (debt < DUST && debt != 0) {
+            repayWithATokens(pool, asset, 0, true);
+        }
+
+        pool.withdraw(asset, getATokenBalance(pool, asset), to);
     }
 
     function modifyLiquidity(IPool pool, ModifyLiquidityAave memory params) internal {
@@ -58,8 +86,8 @@ library AaveHelper {
         if (amount1 < 0) _supplyToAave(pool, params.asset1, uint128(-amount1));
 
         // Withdraw positive amounts (direct calls)
-        if (amount0 > 0) pool.withdraw(params.asset0, uint128(amount0), params.user);
-        if (amount1 > 0) pool.withdraw(params.asset1, uint128(amount1), params.user);
+        if (amount0 > 0) safeWithdraw(pool, params.asset0, uint128(amount0), params.user);
+        if (amount1 > 0) safeWithdraw(pool, params.asset1, uint128(amount1), params.user);
     }
 
     function swap(IPool pool, SwapParamsAave memory params) internal {
@@ -82,6 +110,7 @@ library AaveHelper {
     }
 
     function repay(IPool pool, address asset, uint256 amount, bool max) internal returns (uint256) {
+        IERC20(asset).approve(address(pool), max ? DUST : amount);
         return pool.repay(asset, max ? type(uint256).max : amount, 2, address(this));
     }
 
@@ -130,9 +159,9 @@ library AaveHelper {
      */
     function getPoolMetrics(IPool pool) internal view returns (PoolMetrics memory metrics) {
         (
-            metrics.totalCollateralETH,
-            metrics.totalDebtETH,
-            metrics.availableBorrowsETH,
+            metrics.totalCollateral,
+            metrics.totalDebt,
+            metrics.availableBorrows,
             metrics.currentLiquidationThreshold,
             metrics.ltv,
             metrics.healthFactor
@@ -189,10 +218,10 @@ library AaveHelper {
     /**
      * @dev Get current variable debt balance for an asset
      */
-    function getVariableDebtBalance(IPool pool, address asset, address user) internal view returns (uint256 balance) {
+    function getVariableDebtBalance(IPool pool, address asset) internal view returns (uint256 balance) {
         AssetData memory data = getAssetData(pool, asset);
         if (data.variableDebtTokenAddress != address(0)) {
-            balance = IERC20(data.variableDebtTokenAddress).balanceOf(user);
+            balance = IERC20(data.variableDebtTokenAddress).balanceOf(address(this));
         }
     }
 
@@ -208,14 +237,14 @@ library AaveHelper {
         if (metrics.healthFactor > minHealthFactor) {
             // Calculate additional borrowing capacity while maintaining min health factor
             uint256 maxDebtForHealthFactor =
-                (metrics.totalCollateralETH * metrics.currentLiquidationThreshold) / minHealthFactor / 100;
+                (metrics.totalCollateral * metrics.currentLiquidationThreshold) / minHealthFactor / 100;
 
-            if (maxDebtForHealthFactor > metrics.totalDebtETH) {
-                maxBorrowETH = maxDebtForHealthFactor - metrics.totalDebtETH;
+            if (maxDebtForHealthFactor > metrics.totalDebt) {
+                maxBorrowETH = maxDebtForHealthFactor - metrics.totalDebt;
 
                 // Also consider available liquidity
-                if (maxBorrowETH > metrics.availableBorrowsETH) {
-                    maxBorrowETH = metrics.availableBorrowsETH;
+                if (maxBorrowETH > metrics.availableBorrows) {
+                    maxBorrowETH = metrics.availableBorrows;
                 }
             }
         }
