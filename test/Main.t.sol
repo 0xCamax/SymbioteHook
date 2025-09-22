@@ -8,22 +8,25 @@ import {stdError} from "forge-std/StdError.sol";
 import "../src/SymbioteHook.sol";
 import {PoolMetrics} from "../src/libraries/AaveHelper.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {HookMiner} from "@uniswap/v4-periphery/src/utils/HookMiner.sol";
-import {AbritrumConstants} from "../src/contracts/Constants.sol";
+import {ArbitrumConstants} from "../src/contracts/Constants.sol";
 import {HookDeployer} from "../src/contracts/HookDeployer.sol";
 
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
 import {Commands} from "../src/libraries/Commands.sol";
 
+import {LiquidityMath} from "../src/libraries/LiquidityMath.sol";
+
 /**
  * @title SymbioteHookTests
  * @notice Comprehensive test suite for the cXc Hook implementation
  * @dev Tests cover deployment, initialization, liquidity management, and swap functionality
  */
-contract SymbioteHookTests is Test, AbritrumConstants {
+contract SymbioteHookTests is Test, ArbitrumConstants {
     using StateLibrary for IPoolManager;
     using TickMath for int24;
 
@@ -35,7 +38,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
     address public constant WHALE = 0x0a8494F70031623C9C0043aff4D40f334b458b11;
 
     // Test liquidity amount
-    int128 private constant LIQUIDITY_TO_ADD = 100_000_000_000_000_000;
+    int128 private constant LIQUIDITY_TO_ADD = 1_000_000_000_000_000;
 
     // Default fee for testing (0.3%)
     uint24 private constant DEFAULT_FEE = 3000;
@@ -252,8 +255,9 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         uint128 leveragedLiquidity = uint128(LIQUIDITY_TO_ADD) * 4;
 
         //  total required amounts for leveraged liquidity
-        BalanceDelta amounts =
-            hook.getAmountsForLiquidity(poolKey.toId(), Window(tickLower, tickUpper, leveragedLiquidity, false));
+        BalanceDelta amounts = LiquidityMath.getAmountsForLiquidity(
+            POOL_MANAGER, poolKey.toId(), Window(tickLower, tickUpper, int128(leveragedLiquidity), false)
+        );
 
         uint256 required0 = uint128(amounts.amount0());
         uint256 required1 = uint128(amounts.amount1());
@@ -287,7 +291,9 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         // execute liquidity addition (returns tick range)
         (,, int24 tickLower, int24 tickUpper) = _addLiquidity(LIQUIDITY_TO_ADD, 4);
 
-        _removeLiquidity(poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD , bytes32(abi.encode(4))));
+        _removeLiquidity(
+            poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(abi.encode(4)))
+        );
     }
 
     function test_RemoveLiquidity_Success() public poolInitialized {
@@ -297,8 +303,9 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         uint256 ethBalanceBefore = testAccount.balance;
 
         // Remove liquidity
-        (BalanceDelta liquidityDelta,) =
-            _removeLiquidity(poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(abi.encode(1))));
+        (BalanceDelta liquidityDelta,) = _removeLiquidity(
+            poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(abi.encode(1)))
+        );
 
         // Verify liquidity was removed
         assertGt(liquidityDelta.amount0(), 0, "Should return ETH");
@@ -370,8 +377,10 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         (, uint256 fees0, uint256 fees1,) = hook.getPoolState(poolKey.toId());
 
         // Calculate expected amounts
-        BalanceDelta amounts =
-            hook.getAmountsForLiquidity(poolKey.toId(), Window(tickLower, tickUpper, uint128(LIQUIDITY_TO_ADD), true));
+
+        BalanceDelta amounts = LiquidityMath.getAmountsForLiquidity(
+            POOL_MANAGER, poolKey.toId(), Window(tickLower, tickUpper, LIQUIDITY_TO_ADD, false)
+        );
 
         // Verify fees were generated
         assertTrue(fees0 > 0 || fees1 > 0, "Fees should be generated from swap");
@@ -431,8 +440,9 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         _logPoolMetrics(metricsAfterSwaps);
 
         // Remove liquidity
-        (BalanceDelta liquidityDelta,) =
-            _removeLiquidity(poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(abi.encode(1))));
+        (BalanceDelta liquidityDelta,) = _removeLiquidity(
+            poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(abi.encode(1)))
+        );
 
         uint256 finalETH = testAccount.balance + IERC20(address(WETH)).balanceOf(address(this));
         uint256 finalUSDC = USDC.balanceOf(testAccount);
@@ -469,7 +479,7 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         _flags[1] = Hooks.AFTER_SWAP_FLAG;
         _flags[2] = Hooks.BEFORE_ADD_LIQUIDITY_FLAG;
 
-        bytes memory constructorArgs = abi.encode(address(this), POOL_MANAGER, WETH, AAVE_POOL);
+        bytes memory constructorArgs = abi.encode(address(this), POOL_MANAGER, AAVE_POOL);
         (address hookAddress, bytes32 salt) =
             HookMiner.find(address(HOOK_DEPLOYER), flags, type(SymbioteHook).creationCode, constructorArgs);
 
@@ -536,8 +546,10 @@ contract SymbioteHookTests is Test, AbritrumConstants {
             salt: bytes32(abi.encode(multiplier))
         });
 
-        BalanceDelta amounts = hook.getAmountsForLiquidity(
-            poolKey.toId(), Window(params.tickLower, params.tickUpper, uint128(int128(params.liquidityDelta)), false)
+        BalanceDelta amounts = LiquidityMath.getAmountsForLiquidity(
+            POOL_MANAGER,
+            poolKey.toId(),
+            Window(params.tickLower, params.tickUpper, int128(params.liquidityDelta + 1), false)
         );
         uint256 ethAmount = uint128(amounts.amount0());
         require(ethAmount <= address(this).balance, "Insufficient ETH for liquidity");

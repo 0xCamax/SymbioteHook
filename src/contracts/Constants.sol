@@ -11,7 +11,7 @@ import {IPermit2} from "@permit/interfaces/IPermit2.sol";
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import {IAToken} from "@aave/src/contracts/interfaces/IAToken.sol";
 
-abstract contract AbritrumConstants {
+abstract contract ArbitrumConstants {
     HookDeployer internal constant HOOK_DEPLOYER = HookDeployer(0x7F2A8D28Ea33Fde8c5f2F831EB779B11AB39E1d9);
     IERC20 public constant USDC = IERC20(0xaf88d065e77c8cC2239327C5EDb3A432268e5831);
     IWETH9 public constant WETH = IWETH9(0x82aF49447D8a07e3bd95BD0d56f35241523fBab1);

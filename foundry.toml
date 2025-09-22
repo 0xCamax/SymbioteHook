@@ -4,7 +4,7 @@ out = "out"
 libs = ["lib"]
 via-ir = true
 optimizer = true
-optimizer-runs = 9999999
+optimizer-runs = 999999999
 
 [rpc_endpoints]
 arbitrum = "${ARBITRUM_RPC_URL}"

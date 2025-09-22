@@ -41,8 +41,6 @@ struct PoolMetrics {
     uint256 healthFactor;
 }
 
-import {console2} from "forge-std/Test.sol";
-
 library AaveHelper {
     using AaveHelper for IPool;
 
@@ -97,10 +95,10 @@ library AaveHelper {
 
         if (amount0 > amount1) {
             _supplyToAave(pool, params.asset0, uint128(amount0));
-            pool.withdraw(params.asset1, uint128(-amount1), address(this));
+            safeWithdraw(pool, params.asset1, uint128(-amount1), address(this));
         } else {
             _supplyToAave(pool, params.asset1, uint128(amount1));
-            pool.withdraw(params.asset0, uint128(-amount0), address(this));
+            safeWithdraw(pool, params.asset0, uint128(-amount0), address(this));
         }
     }
 
@@ -116,20 +114,6 @@ library AaveHelper {
 
     function repayWithATokens(IPool pool, address asset, uint256 amount, bool max) internal returns (uint256) {
         return pool.repayWithATokens(asset, max ? type(uint256).max : amount, 2);
-    }
-
-    function maxBorrow(IPool pool, address asset, uint256 amount) internal view returns (uint256) {
-        uint256 ltv = pool.getAssetReserveData(asset).configuration.data & 0xFFFF;
-        return (amount * ltv) / 10000;
-    }
-
-    function safeLeverage(IPool pool, address asset) internal view returns (uint256 leverage) {
-        DataTypes.ReserveDataLegacy memory reserve = pool.getReserveData(asset);
-        uint256 liquidationThreshold = (reserve.configuration.data >> 16) & 0xFFFF;
-        require(liquidationThreshold > 0 && liquidationThreshold < 10000, "Invalid LT");
-
-        uint256 ltWad = (liquidationThreshold * 1e18) / 10000;
-        leverage = 1e36 / (1e18 - ltWad); // 1 / (1 - LT)
     }
 
     function getAssetReserveData(IPool pool, address asset)
@@ -169,43 +153,6 @@ library AaveHelper {
     }
 
     /**
-     * @dev Calculate yield earned since last update using Aave indices
-     */
-    function calculateYieldSinceLastUpdate(
-        IPool pool,
-        address asset,
-        uint256 lastLiquidityIndex,
-        uint256 principalAmount
-    ) internal view returns (uint256 yieldEarned, uint256 currentIndex) {
-        AssetData memory data = getAssetData(pool, asset);
-        currentIndex = data.liquidityIndex;
-
-        if (lastLiquidityIndex > 0 && currentIndex > lastLiquidityIndex) {
-            // Calculate yield using Aave's compound interest formula
-            uint256 indexGrowth = currentIndex - lastLiquidityIndex;
-            yieldEarned = (principalAmount * indexGrowth) / 1e27; // RAY precision
-        }
-    }
-
-    /**
-     * @dev Calculate interest accrued on borrowed amount
-     */
-    function calculateInterestSinceLastUpdate(
-        IPool pool,
-        address asset,
-        uint256 lastBorrowIndex,
-        uint256 borrowedAmount
-    ) internal view returns (uint256 interestAccrued, uint256 currentIndex) {
-        AssetData memory data = getAssetData(pool, asset);
-        currentIndex = data.variableBorrowIndex;
-
-        if (lastBorrowIndex > 0 && currentIndex > lastBorrowIndex) {
-            uint256 indexGrowth = currentIndex - lastBorrowIndex;
-            interestAccrued = (borrowedAmount * indexGrowth) / 1e27; // RAY precision
-        }
-    }
-
-    /**
      * @dev Get current aToken balance for an asset
      */
     function getATokenBalance(IPool pool, address asset) internal view returns (uint256 balance) {
@@ -222,31 +169,6 @@ library AaveHelper {
         AssetData memory data = getAssetData(pool, asset);
         if (data.variableDebtTokenAddress != address(0)) {
             balance = IERC20(data.variableDebtTokenAddress).balanceOf(address(this));
-        }
-    }
-
-    /**
-     * @dev Calculate maximum safe borrowing amount to maintain health factor
-     */
-    function calculateMaxSafeBorrow(
-        IPool pool,
-        uint256 minHealthFactor // e.g., 1.5e18 for 150%
-    ) internal view returns (uint256 maxBorrowETH) {
-        PoolMetrics memory metrics = getPoolMetrics(pool);
-
-        if (metrics.healthFactor > minHealthFactor) {
-            // Calculate additional borrowing capacity while maintaining min health factor
-            uint256 maxDebtForHealthFactor =
-                (metrics.totalCollateral * metrics.currentLiquidationThreshold) / minHealthFactor / 100;
-
-            if (maxDebtForHealthFactor > metrics.totalDebt) {
-                maxBorrowETH = maxDebtForHealthFactor - metrics.totalDebt;
-
-                // Also consider available liquidity
-                if (maxBorrowETH > metrics.availableBorrows) {
-                    maxBorrowETH = metrics.availableBorrows;
-                }
-            }
         }
     }
 

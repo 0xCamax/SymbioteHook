@@ -1,40 +1,32 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import {Pool} from "@uniswap/v4-core/src/libraries/Pool.sol";
-import {TickBitmap} from "@uniswap/v4-core/src/libraries/TickBitmap.sol";
 import {Window} from "../contracts/JITPoolManager.sol";
-import {ActiveLiquidityLibrary} from "./ActiveLiquidity.sol";
+import {IPoolManager, ModifyLiquidityParams} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {Pool} from "@uniswap/v4-core/src/libraries/Pool.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
 library JITLib {
-    using TickBitmap for mapping(int16 => uint256);
-
-    function getJITWindow(Pool.State storage state, int24 spacing, bool zeroForOne)
+    function getJITWindows(Pool.State storage state, int24 spacing, bool zeroForOne)
         internal
         view
-        returns (Window memory window)
+        returns (Window memory active, Window memory next)
     {
-        if (ActiveLiquidityLibrary.isActive()) {
-            (uint128 l, int24 tl, int24 tu, bool a) = ActiveLiquidityLibrary.get();
-            return Window(tl, tu, l, a);
-        }
-        window = getActiveWindow(state, spacing);
+        active = getActiveWindow(state, spacing);
 
-        (int24 tickNext, bool initilized) = state.tickBitmap.nextInitializedTickWithinOneWord(
-            zeroForOne ? window.tickLower - 1 : window.tickLower + 1, spacing, zeroForOne
-        );
+        next = zeroForOne
+            ? Window(active.tickLower - spacing, active.tickLower, 0, false)
+            : Window(active.tickUpper, active.tickUpper + spacing, 0, false);
 
-        Pool.TickInfo storage info = state.ticks[tickNext];
-
-        if (initilized && zeroForOne) {
-            window.tickLower = tickNext;
-            window.liquidity += uint128(-info.liquidityNet);
-        } else if (initilized && !zeroForOne) {
-            window.tickUpper = tickNext + spacing;
-            window.liquidity += uint128(info.liquidityNet);
+        if (zeroForOne) {
+            Pool.TickInfo storage info = state.ticks[next.tickUpper];
+            next.liquidity = active.liquidity + -info.liquidityNet;
+        } else {
+            Pool.TickInfo storage info = state.ticks[next.tickLower];
+            next.liquidity = active.liquidity + info.liquidityNet;
         }
 
-        return window;
+        return (active, next);
     }
 
     function getActiveWindow(Pool.State storage state, int24 spacing) internal view returns (Window memory) {
@@ -43,8 +35,13 @@ library JITLib {
         return Window({
             tickLower: activeTickLower,
             tickUpper: activeTickLower + spacing,
-            liquidity: state.liquidity,
+            liquidity: int128(state.liquidity),
             initialized: true
         });
+    }
+
+    function modify(IPoolManager pm, PoolKey memory key, Window memory w) internal {
+        if (w.liquidity == 0) return;
+        pm.modifyLiquidity(key, ModifyLiquidityParams(w.tickLower, w.tickUpper, w.liquidity, bytes32(0)), "");
     }
 }

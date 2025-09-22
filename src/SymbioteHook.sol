@@ -3,12 +3,11 @@ pragma solidity ^0.8.0;
 
 import "./contracts/BaseHook.sol";
 import "./contracts/JITPoolManager.sol";
+import {Test, console2} from "forge-std/Test.sol";
 
 contract SymbioteHook is BaseHook, JITPoolManager {
-    using StateLibrary for IPoolManager;
-
-    constructor(address initialOwner, address _poolManager, address _WETH, address _aavePool)
-        JITPoolManager(initialOwner, _poolManager, _WETH, _aavePool)
+    constructor(address initialOwner, address _poolManager, address _aavePool)
+        JITPoolManager(initialOwner, _poolManager, _aavePool)
     {}
 
     /*
@@ -49,13 +48,13 @@ contract SymbioteHook is BaseHook, JITPoolManager {
         remove JIT liquidity
         */
 
-        (, int24 tick,,) = poolManager.getSlot0(key.toId());
+        (, int24 tick,,) = StateLibrary.getSlot0(poolManager, key.toId());
+        (, Window memory next) = JITLib.getJITWindows(_getPool(key.toId()), key.tickSpacing, params.zeroForOne);
 
-        (, int24 tickLower, int24 tickUpper,) = ActiveLiquidityLibrary.get();
         if (params.zeroForOne) {
-            require(tickLower < tick, "Slippage");
+            require(next.tickLower < tick, "Slippage");
         } else {
-            require(tickUpper > tick, "Slippage");
+            require(next.tickUpper > tick, "Slippage");
         }
 
         _jitModifyLiquidity(key, params.zeroForOne, false);

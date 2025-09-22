@@ -23,12 +23,6 @@ SymbioteHook enables liquidity providers to earn yield on their capital while it
 │   Uniswap V4    │    │  SymbioteHook   │    │   Aave Pool     │
 │   Pool Manager  │◄──►│   (JIT Logic)   │◄──►│   (Lending)     │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
-                              │
-                              ▼
-                       ┌─────────────────┐
-                       │ Active Liquidity │
-                       │    Library      │
-                       └─────────────────┘
 ```
 
 ## Core Components
@@ -45,10 +39,6 @@ Abstract contract handling:
 - Aave lending/borrowing integration
 - Granular liquidity distribution
 - Flash loan-like operations for capital efficiency
-
-### ActiveLiquidityLibrary
-
-Bytecode-optimized library for tracking active liquidity state in transient storage.
 
 ## How It Works
 
