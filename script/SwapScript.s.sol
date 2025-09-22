@@ -21,11 +21,11 @@ contract HookSwapScript is Script, ArbitrumConstants {
             currency1: Currency.wrap(address(USDC)),
             fee: 3000,
             tickSpacing: 50,
-            hooks: IHooks(address(0)) // put deployed hook address here
+            hooks: IHooks(address(0x3b7FC24025De469e70ad739A62F81ac3Ac25c8c0)) // put deployed hook address here
         });
 
         // example: swap 0.1 ETH -> USDC
-        _swap(0.1 ether, true, deployerPrivateKey);
+        _swap(0.0001 ether, true, deployerPrivateKey);
     }
 
     function _swap(uint128 amountIn, bool zeroForOne, uint256 deployerPrivateKey) private {

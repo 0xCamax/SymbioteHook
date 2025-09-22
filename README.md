@@ -27,11 +27,11 @@ SymbioteHook enables liquidity providers to earn yield on their capital while it
 
 ## Core Components
 
-### SymbioteHook
+### SymbioteHook.sol
 
 The main hook contract that inherits from `BaseHook` and `JITPoolManager`. Manages the lifecycle of JIT liquidity operations.
 
-### JITPoolManager
+### JITPoolManager.sol
 
 Abstract contract handling:
 
