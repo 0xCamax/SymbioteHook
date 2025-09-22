@@ -35,10 +35,10 @@ library ActiveLiquidityLibrary {
         bytes32 slot = SLOT;
         assembly {
             let data := sload(slot)
-            l := and(data, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF)              // bits 0-127
-            tL := and(shr(128, data), 0xFFFFFF)                            // bits 128-151
-            tU := and(shr(152, data), 0xFFFFFF)                            // bits 152-175
-            active := eq(and(shr(224, data), 1), 1)                        // bit 224
+            l := and(data, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF) // bits 0-127
+            tL := and(shr(128, data), 0xFFFFFF) // bits 128-151
+            tU := and(shr(152, data), 0xFFFFFF) // bits 152-175
+            active := eq(and(shr(224, data), 1), 1) // bit 224
         }
     }
 
@@ -60,4 +60,3 @@ library ActiveLiquidityLibrary {
         }
     }
 }
-

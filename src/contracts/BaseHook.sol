@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
@@ -11,6 +10,7 @@ abstract contract BaseHook {
     error NotImplemented();
     /// @notice The hook called before liquidity is added
     /// @return bytes4 The function selector for the hook
+
     function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         external
         virtual
@@ -18,7 +18,6 @@ abstract contract BaseHook {
     {
         revert NotImplemented();
     }
-
 
     /// @notice The hook called before a swap
     /// @return bytes4 The function selector for the hook
@@ -42,5 +41,4 @@ abstract contract BaseHook {
     {
         revert NotImplemented();
     }
-
 }

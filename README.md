@@ -1,158 +1,225 @@
-# JIT Pool Manager
+# SymbioteHook
 
-A sophisticated Just-In-Time (JIT) liquidity management system built on Uniswap V4 with integrated Aave lending protocol support for leveraged liquidity provision.
+A Uniswap V4 hook that integrates Aave lending protocol for capital-efficient liquidity provision through Just-In-Time (JIT) mechanisms.
 
 ## Overview
 
-The JIT Pool Manager enables automated liquidity provision with leverage through a window-based system that optimally distributes capital across price ranges. By integrating with Aave's lending protocol, liquidity providers can achieve leveraged positions while maintaining efficient capital utilization.
+SymbioteHook enables liquidity providers to earn yield on their capital while it's not actively being used for swaps by storing idle liquidity in Aave instead of the Uniswap pool manager. The hook provides JIT liquidity during swaps and allows users to borrow against their deposited liquidity.
 
 ## Key Features
 
-### 🚀 **Just-In-Time Liquidity**
-
-- Automated liquidity provision based on current market conditions
-- Window-based distribution system for optimal capital allocation
-- Real-time synchronization with Uniswap V4 pool states
-
-### 💰 **Leveraged Positions**
-
-- Integration with Aave lending protocol for borrowing capacity
-- Dynamic leverage calculation based on asset safety parameters
-- Automated collateral management and position health monitoring
-
-### 🎯 **Window-Based Management**
-
-- Intelligent liquidity distribution across price ranges
-- Automatic window initialization and liquidity rebalancing
-- Efficient capital deployment through active window targeting
-
-### 🔄 **Advanced Settlement**
-
-- Flash loan integration for capital-efficient operations
-- Automated token wrapping/unwrapping (ETH ↔ WETH)
-- Comprehensive token sweeping and settlement mechanisms
+- **Aave Integration**: Stores idle liquidity in Aave to earn lending yield
+- **JIT Liquidity**: Automatically provides liquidity just before swaps and removes it afterward
+- **Borrowing Capability**: Allows users to borrow against their deposited liquidity positions
+- **Capital Efficiency**: Maximizes capital utilization through dual yield sources
+- **Slippage Protection**: Built-in slippage checks to protect JIT operations
 
 ## Architecture
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   JIT Pool      │    │   Uniswap V4    │    │   Aave Lending  │
-│   Manager       │◄──►│   Pool Manager  │    │   Pool          │
-│                 │    │                 │    │                 │
+│   Uniswap V4    │    │  SymbioteHook   │    │   Aave Pool     │
+│   Pool Manager  │◄──►│   (JIT Logic)   │◄──►│   (Lending)     │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │
-         ├─ Window Management    ├─ Price Discovery      ├─ Lending/Borrowing
-         ├─ Liquidity Distribution├─ Swap Execution      ├─ Collateral Management
-         └─ Position Tracking    └─ Fee Collection       └─ Health Factor Monitoring
+                              │
+                              ▼
+                       ┌─────────────────┐
+                       │ Active Liquidity │
+                       │    Library      │
+                       └─────────────────┘
 ```
 
 ## Core Components
 
-### Windows
+### SymbioteHook
 
-- **Purpose**: Discrete price ranges for liquidity distribution
-- **Structure**: Each window spans one tick spacing and contains liquidity amount
-- **Management**: Automatic initialization and liquidity balancing
+The main hook contract that inherits from `BaseHook` and `JITPoolManager`. Manages the lifecycle of JIT liquidity operations.
 
-### Positions
+### JITPoolManager
 
-- **Tracking**: Comprehensive position information including owner, range, and liquidity
-- **Leverage**: Dynamic leverage calculation with safety limits
-- **Fees**: Automatic fee collection and distribution
+Abstract contract handling:
 
-### Aave Integration
+- Position management with leverage multipliers
+- Aave lending/borrowing integration
+- Granular liquidity distribution
+- Flash loan-like operations for capital efficiency
 
-- **Borrowing**: Automated borrowing against deposited collateral
-- **Repayment**: Flexible repayment options including aToken direct repayment
-- **Health Monitoring**: Real-time position health and leverage monitoring
+### ActiveLiquidityLibrary
 
-### JIT Operations
+Bytecode-optimized library for tracking active liquidity state in transient storage.
+
+## How It Works
+
+### 1. Liquidity Provision
+
+Users provide liquidity through the hook with optional leverage multipliers:
 
 ```solidity
-// Execute JIT liquidity for incoming swap
-function beforeSwap(
-    address,
-    PoolKey calldata key,
-    IPoolManager.SwapParams calldata params,
-    bytes calldata
-) external returns (bytes4, BeforeSwapDelta, uint24) {
-    // Add JIT liquidity
-    _jitModifyLiquidity(key, params.zeroForOne, true);
+function modifyLiquidity(
+    PoolKey memory key,
+    ModifyLiquidityParams memory params,
+    uint16 multiplier
+) external payable
+```
 
-    return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
-}
+- Liquidity is distributed across windows (tick ranges)
+- Base liquidity is deposited into Aave for yield
+- Leveraged positions can borrow additional capital from Aave
 
-function afterSwap(
-    address,
-    PoolKey calldata key,
-    IPoolManager.SwapParams calldata params,
-    BalanceDelta,
-    bytes calldata
-) external returns (bytes4, int128) {
-    // Remove JIT liquidity
-    _jitModifyLiquidity(key, params.zeroForOne, false);
+### 2. JIT Operation Flow
 
-    return (this.afterSwap.selector, 0);
+**Before Swap (`beforeSwap`)**:
+
+1. Hook detects incoming swap
+2. Calculates required liquidity windows
+3. Temporarily adds JIT liquidity to the pool
+4. Stores active liquidity reference in transient storage
+
+**After Swap (`afterSwap`)**:
+
+1. Verifies slippage protection conditions
+2. Removes JIT liquidity from the pool
+3. Settles any token imbalances through Aave
+4. Returns excess tokens to Aave for yield
+
+### 3. Window Management
+
+Liquidity is organized in "windows" - specific tick ranges where liquidity is concentrated:
+
+```solidity
+struct Window {
+    int24 tickLower;
+    int24 tickUpper;
+    uint128 liquidity;
+    bool initialized;
 }
 ```
 
-## Advanced Features
+The JIT algorithm selects appropriate windows based on:
 
-### Dynamic Leverage Calculation
+- Current price/tick position
+- Swap direction (`zeroForOne`)
+- Available liquidity in adjacent windows
 
-The system automatically calculates maximum safe leverage based on Aave's risk parameters:
+## Position Management
 
-```solidity
-function getMaxLeverage(PoolKey memory key) public view returns (uint16) {
-    // Returns leverage scaled by 1000 (2500 = 2.5x)
-    // Based on minimum safe leverage of both assets
-}
-```
-
-### Window Management
-
-Active windows are determined based on current price and swap direction:
+### Creating Positions
 
 ```solidity
-function getActiveWindows(PoolKey memory key, bool zeroForOne)
-    public returns (Window[2] memory) {
-    // Returns current active window and adjacent window
-    // Automatically initializes windows if needed
-}
+// Create a 2x liquidity position
+modifyLiquidity(poolKey, params, 2);
 ```
 
-### Health Monitoring
+## Aave Integration
+
+### Lending Operations
+
+- Deposits idle liquidity to earn yield
+- Automatically compounds through Aave's aToken mechanism
+
+### Borrowing Operations
 
 ```solidity
-function getPositionData() public view returns (PoolMetrics memory) {
-    // Returns comprehensive position health data
-    // Including health factor, utilization rates, etc.
-}
+// Borrow against deposited collateral
+borrow(asset, amount);
+
+// Repay with underlying tokens
+repay(asset, amount, maxRepay);
+
+// Repay directly with aTokens
+repayWithATokens(asset, amount, maxRepay);
 ```
 
-## Security Considerations
+### Health Factor Monitoring
+
+```solidity
+// Get current position metrics
+PoolMetrics memory metrics = getPositionData();
+```
+
+## Security Features
 
 ### Access Control
 
-- Only contract owner can add/remove liquidity
-- Position-specific access control for modifications
-- Protected Aave interactions
+- `auth` modifier restricts critical functions to owner or contract
+- Hook restrictions prevent external liquidity additions
 
-### Smart Settlements
+### Slippage Protection
 
-- Direct aToken repayments when possible
-- Efficient token sweeping mechanisms
+```solidity
+// Ensures JIT operations don't execute with excessive slippage
+if (params.zeroForOne) {
+    require(tickLower < tick, "Slippage");
+} else {
+    require(tickUpper > tick, "Slippage");
+}
+```
 
-### Validation
+## Usage Example
 
-- Comprehensive parameter validation
-- Pool state synchronization checks
-- Leverage limit enforcement
+```solidity
+// 1. Deploy the hook
+SymbioteHook hook = new SymbioteHook(
+    owner,
+    poolManager,
+    weth,
+    aavePool
+);
+
+// 2. Initialize a pool with the hook
+PoolKey memory key = PoolKey({
+    currency0: token0,
+    currency1: token1,
+    fee: 3000,
+    tickSpacing: 60,
+    hooks: IHooks(address(hook))
+});
+
+// 3. Provide liquidity with 2x leverage
+hook.modifyLiquidity{value: ethAmount}(
+    key,
+    ModifyLiquidityParams({
+        tickLower: -600,
+        tickUpper: 600,
+        liquidityDelta: 1000e18,
+        salt: bytes32(0)
+    }),
+    2  // 2x multiplier
+);
+
+// 4. Swaps automatically trigger JIT liquidity
+// Users can also borrow against their positions
+hook.borrow(address(token0), borrowAmount);
+```
+
+## Risk Considerations
+
+### Liquidation Risk
+
+- Leveraged positions can be liquidated if health factor drops below threshold
+- Monitor Aave health factor regularly
+
+### Smart Contract Risk
+
+- Dependent on Aave protocol security
+- Uniswap V4 hook system risks
+
+### Impermanent Loss
+
+- Concentrated liquidity positions subject to impermanent loss
+- Amplified by leverage multipliers
+
+## Dependencies
+
+- **Uniswap V4**: Core AMM functionality
+- **Aave V3**: Lending and borrowing protocol
+- **OpenZeppelin**: ERC20 token standards
+- **Solmate**: Gas-optimized contract utilities
+
+## License
+
+MIT License - See LICENSE file for details.
 
 ## Disclaimer
 
-This is experimental software. Use at your own risk. Always conduct thorough testing and audits before deploying to mainnet.
-
----
-
-_Built with ❤️ for the DeFi ecosystem_
+This is experimental DeFi infrastructure. Use at your own risk. Ensure thorough testing and auditing before mainnet deployment.

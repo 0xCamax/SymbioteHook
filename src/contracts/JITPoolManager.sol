@@ -30,6 +30,8 @@ struct PositionInfo {
     int24 tickUpper;
     /// @notice The amount of liquidity in this position
     uint128 liquidity;
+    /// @notice The multiplier of liquidity in this position
+    uint16 multiplier;
 }
 
 /// @notice Represents a liquidity window within a tick range
@@ -166,6 +168,7 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         auth
         returns (bytes32 positionId, BalanceDelta principalDelta, BalanceDelta feesAccrued)
     {
+        params.salt = bytes32(abi.encodePacked(multiplier));
         int128 totalLiquidity = int128(params.liquidityDelta * int16(multiplier));
         int24 nWindows = (params.tickUpper - params.tickLower) / key.tickSpacing;
         if (nWindows < 0) nWindows = -nWindows;
@@ -191,12 +194,13 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
             feesAccrued = feesAccrued + fa;
         }
 
-        positionId = Position.calculatePositionKey(msg.sender, params.tickLower, params.tickUpper, bytes32(0));
+        positionId = Position.calculatePositionKey(msg.sender, params.tickLower, params.tickUpper, params.salt);
         positionInfo[key.toId()][positionId] = PositionInfo(
             msg.sender,
             params.tickLower,
             params.tickUpper,
-            uint128(int128(positionInfo[key.toId()][positionId].liquidity) + totalLiquidity)
+            uint128(int128(positionInfo[key.toId()][positionId].liquidity) + int128(params.liquidityDelta)),
+            multiplier
         );
 
         _resolveModifyLiquidity(key, principalDelta + feesAccrued, multiplier);
@@ -230,8 +234,8 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
     /// @notice Resolves liquidity changes and interacts with Aave if necessary
     function _resolveModifyLiquidity(PoolKey memory key, BalanceDelta deltas, uint16 multiplier) internal {
         (address a0, address a1, int128 d0, int128 d1) = _get(key, deltas);
-        uint256 b0 = aavePool.getATokenBalance(a0, address(this));
-        uint256 b1 = aavePool.getATokenBalance(a1, address(this));
+        uint256 b0 = aavePool.getATokenBalance(a0);
+        uint256 b1 = aavePool.getATokenBalance(a1);
 
         if ((int256(b0) < d0 && d0 > 0) || (int256(b1) < d1 && d1 > 0)) {
             deltas = toBalanceDelta(int128(int256(b0)), int128(int256(b1)));
@@ -286,8 +290,8 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
     }
 
     /// @notice Repays debt to Aave
-    function repay(address asset, uint256 amount, bool max) public auth {
-        aavePool.repay(asset, max ? type(uint256).max : amount, 2, address(this));
+    function repay(address asset, uint256 amount, bool max) public auth returns (uint256) {
+        return aavePool.repay(asset, max ? type(uint256).max : amount, 2, address(this));
     }
 
     /// @notice Repays using aTokens directly
@@ -318,6 +322,10 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
 
         if (d0 < 0) _settle(key.currency0, address(this), d0);
         if (d1 < 0) _settle(key.currency1, address(this), d1);
+    }
+
+    function poolId(PoolKey memory key) external pure returns (PoolId) {
+        return key.toId();
     }
 
     /// @notice Internal getter for pool state

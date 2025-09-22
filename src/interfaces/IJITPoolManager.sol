@@ -45,5 +45,4 @@ interface IJITPoolManager {
     event JITLiquidity(
         PoolId indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta
     );
-
 }

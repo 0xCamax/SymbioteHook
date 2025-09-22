@@ -81,11 +81,11 @@ library AaveHelper {
         pool.borrow(asset, amount, 2, 0, address(this));
     }
 
-    function repay(IPool pool, address asset, uint256 amount, bool max) internal {
-        pool.repay(asset, max ? type(uint256).max : amount, 2, address(this));
+    function repay(IPool pool, address asset, uint256 amount, bool max) internal returns (uint256) {
+        return pool.repay(asset, max ? type(uint256).max : amount, 2, address(this));
     }
 
-        function repayWithATokens(IPool pool, address asset, uint256 amount, bool max) internal returns (uint256) {
+    function repayWithATokens(IPool pool, address asset, uint256 amount, bool max) internal returns (uint256) {
         return pool.repayWithATokens(asset, max ? type(uint256).max : amount, 2);
     }
 
@@ -179,10 +179,10 @@ library AaveHelper {
     /**
      * @dev Get current aToken balance for an asset
      */
-    function getATokenBalance(IPool pool, address asset, address user) internal view returns (uint256 balance) {
+    function getATokenBalance(IPool pool, address asset) internal view returns (uint256 balance) {
         AssetData memory data = getAssetData(pool, asset);
         if (data.aTokenAddress != address(0)) {
-            balance = IAToken(data.aTokenAddress).balanceOf(user);
+            balance = IAToken(data.aTokenAddress).balanceOf(address(this));
         }
     }
 

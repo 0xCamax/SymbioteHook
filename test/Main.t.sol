@@ -363,10 +363,8 @@ contract SymbioteHookTests is Test, AbritrumConstants {
         (, uint256 fees0, uint256 fees1,) = hook.getPoolState(poolKey.toId());
 
         // Calculate expected amounts
-        BalanceDelta amounts = hook.getAmountsForLiquidity(
-            poolKey.toId(),
-            Window(tickLower, tickUpper, uint128(LIQUIDITY_TO_ADD), true)
-        );
+        BalanceDelta amounts =
+            hook.getAmountsForLiquidity(poolKey.toId(), Window(tickLower, tickUpper, uint128(LIQUIDITY_TO_ADD), true));
 
         // Verify fees were generated
         assertTrue(fees0 > 0 || fees1 > 0, "Fees should be generated from swap");
