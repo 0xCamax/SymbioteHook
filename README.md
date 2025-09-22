@@ -2,6 +2,8 @@
 
 A Uniswap V4 hook that integrates Aave lending protocol for capital-efficient liquidity provision through Just-In-Time (JIT) mechanisms.
 
+## “No partner integrations”
+
 ## Overview
 
 SymbioteHook enables liquidity providers to earn yield on their capital while it's not actively being used for swaps by storing idle liquidity in Aave instead of the Uniswap pool manager. The hook provides JIT liquidity during swaps and allows users to borrow against their deposited liquidity.
