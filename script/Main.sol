@@ -27,9 +27,22 @@ contract HookScript is Script, ArbitrumConstants {
     PoolKey internal baseKey;
     SymbioteHook internal hook;
 
-    function setUp() public {}
+    uint256 deployerPrivateKey;
+
+    ModifyLiquidityParams internal params;
+
+    function setUp() public {
+        deployerPrivateKey = vm.envUint("PRIVATE_KEY");
+        hook = SymbioteHook(payable(0x5958786F1ea187531a423bC960718564A45f48c0));
+        _configurePoolKeys(3000, 50, address(hook));
+    }
 
     function run() public {
+        deployHook();
+        initializePool();
+    }
+
+    function deployHook() public {
         uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG);
 
         uint160[] memory _flags = new uint160[](3);
@@ -40,9 +53,9 @@ contract HookScript is Script, ArbitrumConstants {
         bytes memory constructorArgs = abi.encode(0xa14BB91455e3b70d2d4F59a0D3CbF35d939308Fc, POOL_MANAGER, AAVE_POOL);
         (address hookAddress, bytes32 salt) =
             HookMiner.find(address(HOOK_DEPLOYER), flags, type(SymbioteHook).creationCode, constructorArgs);
+
         _configurePoolKeys(3000, 50, hookAddress);
 
-        uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         vm.broadcast(deployerPrivateKey);
         hook = SymbioteHook(
             payable(
@@ -50,17 +63,53 @@ contract HookScript is Script, ArbitrumConstants {
             )
         );
 
-        console2.log("Hook address:", address(hook));
-
+        console2.log("Hook deployed at:", address(hook));
         require(address(hook) == hookAddress, "Hook address mismatch");
+    }
 
-        _setupApprovals(deployerPrivateKey);
+    function initializePool() public {
+        require(address(hook) != address(0), "Hook not deployed");
 
-        // Initialize pool
-        _initializePool(deployerPrivateKey);
+        _setupApprovals();
 
-        // Add liquidity (EOA must have ETH)
-        _addLiquidity(5e14, 4, deployerPrivateKey);
+        (, int24 baseTick,,) = POOL_MANAGER.getSlot0(baseKey.toId());
+        uint160 sqrtPrice = (baseTick - (baseTick % poolKey.tickSpacing)).getSqrtPriceAtTick();
+
+        vm.broadcast(deployerPrivateKey);
+        hook.initialize(poolKey, sqrtPrice);
+
+        console2.log("Pool initialized");
+    }
+
+    function addLiquidity(uint256 amount0, uint16 multiplier) public {
+        require(address(hook) != address(0), "Hook not deployed");
+
+        _addLiquidity(amount0, multiplier);
+        console2.log("Liquidity added");
+    }
+
+    function removeLiquidity() public {
+        require(address(hook) != address(0), "Hook not deployed");
+
+        _removeLiquidity(poolKey, params);
+        console2.log("Liquidity removed");
+    }
+
+    function borrow(uint256 amount) public {
+        vm.broadcast(deployerPrivateKey);
+        hook.borrow(address(WETH), amount);
+    }
+
+    function swap(uint128 amountIn, bool zeroForOne) public {
+        _swap(amountIn, zeroForOne);
+    }
+
+    function _removeLiquidity(PoolKey memory _key, ModifyLiquidityParams memory _params)
+        private
+        returns (BalanceDelta liquidityDelta, BalanceDelta feesAccrued)
+    {
+        _params.liquidityDelta = -_params.liquidityDelta;
+        (, liquidityDelta, feesAccrued) = hook.modifyLiquidity{value: 1_000}(_key, _params);
     }
 
     function _configurePoolKeys(uint24 fee, int24 tickSpacing, address hookAddress) private {
@@ -81,20 +130,20 @@ contract HookScript is Script, ArbitrumConstants {
         });
     }
 
-    function _setupApprovals(uint256 deployerPrivateKey) private {
+    function _setupApprovals() private {
         vm.broadcast(deployerPrivateKey);
         USDC.approve(address(hook), type(uint256).max);
         USDC.approve(address(PERMIT2), type(uint256).max);
     }
 
-    function _initializePool(uint256 deployerPrivateKey) private {
+    function _initializePool() private {
         (, int24 baseTick,,) = POOL_MANAGER.getSlot0(baseKey.toId());
         uint160 sqrtPrice = (baseTick - (baseTick % poolKey.tickSpacing)).getSqrtPriceAtTick();
         vm.broadcast(deployerPrivateKey);
         hook.initialize(poolKey, sqrtPrice);
     }
 
-    function _addLiquidity(uint256 amount0, uint16 multiplier, uint256 deployerPrivateKey)
+    function _addLiquidity(uint256 amount0, uint16 multiplier)
         private
         returns (bytes32 positionId, BalanceDelta feesAccrued, int24 tickLower, int24 tickUpper)
     {
@@ -107,7 +156,7 @@ contract HookScript is Script, ArbitrumConstants {
             tickLower.getSqrtPriceAtTick(), tickUpper.getSqrtPriceAtTick(), amount0
         );
 
-        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+        params = ModifyLiquidityParams({
             tickLower: tickLower,
             tickUpper: tickUpper,
             liquidityDelta: int128(liquidity),
@@ -124,5 +173,41 @@ contract HookScript is Script, ArbitrumConstants {
         vm.broadcast(deployerPrivateKey);
         (positionId,, feesAccrued) = hook.modifyLiquidity{value: ethAmount}(poolKey, params);
         console2.log("Position Id: ", vm.toString(positionId));
+    }
+
+    function _swap(uint128 amountIn, bool zeroForOne) private {
+        bytes memory commands = abi.encodePacked(uint8(Commands.V4_SWAP));
+        bytes memory actions =
+            abi.encodePacked(uint8(Actions.SWAP_EXACT_IN_SINGLE), uint8(Actions.SETTLE_ALL), uint8(Actions.TAKE_ALL));
+
+        bytes[] memory _params = new bytes[](3);
+        _params[0] = abi.encode(
+            IV4Router.ExactInputSingleParams({
+                poolKey: poolKey,
+                zeroForOne: zeroForOne,
+                amountIn: amountIn,
+                amountOutMinimum: 0,
+                hookData: bytes("")
+            })
+        );
+
+        _params[1] = abi.encode(zeroForOne ? poolKey.currency0 : poolKey.currency1, amountIn);
+        _params[2] = abi.encode(zeroForOne ? poolKey.currency1 : poolKey.currency0, 0);
+
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = abi.encode(actions, _params);
+        uint256 deadline = block.timestamp + 1 days;
+        vm.startBroadcast(deployerPrivateKey);
+
+        if (!zeroForOne) {
+            // Approve USDC (currency1) to Router via Permit2
+            PERMIT2.approve(
+                Currency.unwrap(poolKey.currency1), address(ROUTER), type(uint160).max, uint48(block.timestamp + 1 days)
+            );
+        }
+
+        ROUTER.execute{value: zeroForOne ? amountIn : 0}(commands, inputs, deadline);
+
+        vm.stopBroadcast();
     }
 }

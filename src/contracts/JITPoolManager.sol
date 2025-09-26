@@ -29,6 +29,8 @@ struct PositionInfo {
     uint128 liquidity;
     /// @notice The multiplier of liquidity in this position
     uint16 multiplier;
+    /// @notice Position debt
+    BalanceDelta debt;
 }
 
 /// @notice Represents a liquidity window within a tick range
@@ -97,13 +99,11 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         // Track active liquidity for next JIT operation
         if (add) {
             _checkSlot0Sync(id);
-
             JITLib.modify(poolManager, key, active);
-
             JITLib.modify(poolManager, key, next);
         } else {
-            active.liquidity *= -1;
-            next.liquidity *= -1;
+            active.liquidity = -active.liquidity;
+            next.liquidity = -next.liquidity;
             JITLib.modify(poolManager, key, active);
             JITLib.modify(poolManager, key, next);
             _syncPoolState(id);
@@ -154,34 +154,35 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         returns (bytes32 positionId, BalanceDelta principalDelta, BalanceDelta feesAccrued)
     {
         uint16 multiplier = uint16(uint256(params.salt));
-        int128 totalLiquidity = int128(params.liquidityDelta * int16(multiplier));
+        int128 totalLiquidity = int128(int256(params.liquidityDelta) * int256(uint256(multiplier)));
         int24 nWindows = (params.tickUpper - params.tickLower) / key.tickSpacing;
 
+        int24 lower = params.tickLower;
+
         for (int24 i = 0; i < nWindows; i++) {
-            int24 lower = params.tickLower + key.tickSpacing * i;
+            params.tickLower = lower;
+            params.tickUpper = lower + key.tickSpacing;
+            params.liquidityDelta = totalLiquidity;
 
-            ModifyLiquidityParams memory p = ModifyLiquidityParams({
-                tickLower: lower,
-                tickUpper: lower + key.tickSpacing,
-                liquidityDelta: totalLiquidity,
-                salt: params.salt
-            });
-
-            (BalanceDelta pd, BalanceDelta fa) = _modifyLiquidity(key, p);
+            (BalanceDelta pd, BalanceDelta fa) = _modifyLiquidity(key, params);
             principalDelta = principalDelta + pd;
             feesAccrued = feesAccrued + fa;
+
+            lower += key.tickSpacing;
         }
 
         positionId = Position.calculatePositionKey(msg.sender, params.tickLower, params.tickUpper, params.salt);
-        positionInfo[key.toId()][positionId] = PositionInfo(
-            msg.sender,
-            params.tickLower,
-            params.tickUpper,
-            uint128(int128(positionInfo[key.toId()][positionId].liquidity) + int128(params.liquidityDelta)),
-            multiplier
-        );
+        PositionInfo storage info = positionInfo[key.toId()][positionId];
 
-        _resolveModifyLiquidity(key, principalDelta + feesAccrued, multiplier);
+        info.owner = msg.sender;
+        info.tickLower = params.tickLower;
+        info.tickUpper = params.tickUpper;
+        info.liquidity = uint128(int128(info.liquidity) + int128(params.liquidityDelta));
+        info.multiplier = multiplier;
+
+        _resolve(key, principalDelta + feesAccrued, positionId);
+
+        _sweep(key);
 
         emit ModifyLiquidity(positionId, msg.sender, params.tickLower, params.tickUpper, totalLiquidity, params.salt);
     }
@@ -209,37 +210,15 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         }
     }
 
-    /// @notice Resolves liquidity changes and interacts with Aave if necessary
-    function _resolveModifyLiquidity(PoolKey memory key, BalanceDelta deltas, uint16 multiplier) internal {
-        (address a0, address a1, int128 d0, int128 d1) = _get(key, deltas);
-
-        if (multiplier == 1) {
-            if (d0 < 0) {
-                if (key.currency0.isAddressZero()) {
-                    require(msg.value >= uint128(-d0));
-                    WETH.deposit{value: msg.value}();
-                } else {
-                    IERC20(Currency.unwrap(key.currency0)).transferFrom(msg.sender, address(this), uint128(-d0));
-                }
-            }
-            if (d1 < 0) {
-                IERC20(Currency.unwrap(key.currency1)).transferFrom(msg.sender, address(this), uint128(-d1));
-            }
-            aavePool.modifyLiquidity(ModifyLiquidityAave(msg.sender, a0, a1, deltas));
-        } else {
-            _flash(key, deltas, multiplier);
-        }
-        _sweep(key);
-    }
-
     /// @notice Performs flash-like JIT operations
-    function _flash(PoolKey memory key, BalanceDelta deltas, uint16 multiplier) internal {
-        poolManager.unlock(abi.encode(msg.sender, key, deltas, multiplier));
+    function _resolve(PoolKey memory key, BalanceDelta deltas, bytes32 positionId) internal {
+        poolManager.unlock(abi.encode(key, deltas, positionId));
     }
 
     /// @notice Settles asset amounts with pool manager
     function _settle(Currency currency, address from, int256 amount) internal {
         uint256 _amount = uint256(-amount);
+
         if (currency.isAddressZero()) {
             if (address(this).balance < _amount) {
                 require(WETH.balanceOf(address(this)) >= _amount);
@@ -256,18 +235,28 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         }
     }
 
+    function supply(address asset, uint128 amount) external auth {
+        IERC20(asset).transferFrom(msg.sender, address(this), amount);
+        aavePool.supplyToAave(asset, amount);
+    }
+
+    function withdraw(address asset, uint128 amount) external auth {
+        aavePool.safeWithdraw(asset, amount, msg.sender);
+    }
+    
     /// @notice Borrows assets from Aave pool
-    function borrow(address asset, uint256 amount) public auth {
+    function borrow(address asset, uint256 amount) external auth {
         aavePool.borrow(asset, amount);
+        IERC20(asset).transfer(msg.sender, amount);
     }
 
     /// @notice Repays debt to Aave
-    function repay(address asset, uint256 amount, bool max) public auth returns (uint256) {
+    function repay(address asset, uint256 amount, bool max) external auth returns (uint256) {
         return aavePool.repay(asset, amount, max);
     }
 
     /// @notice Repays using aTokens directly
-    function repayWithATokens(address asset, uint256 amount, bool max) public auth returns (uint256) {
+    function repayWithATokens(address asset, uint256 amount, bool max) external auth returns (uint256) {
         return aavePool.repayWithATokens(asset, amount, max);
     }
 
@@ -340,50 +329,115 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         a1 = Currency.unwrap(key.currency1);
     }
 
-    /// @notice Callback handler for flash-like JIT operations
     function _unlockCallback(bytes calldata data) internal override returns (bytes memory) {
-        (address user, PoolKey memory key, BalanceDelta deltas, uint16 multiplier) =
-            abi.decode(data, (address, PoolKey, BalanceDelta, uint16));
+        (PoolKey memory key, BalanceDelta deltas, bytes32 positionId) =
+            abi.decode(data, (PoolKey, BalanceDelta, bytes32));
+
+        PoolId id = key.toId();
+        Currency c0 = key.currency0;
+        Currency c1 = key.currency1;
+
+        PositionInfo storage info = positionInfo[id][positionId];
         (address a0, address a1, int128 d0, int128 d1) = _get(key, deltas);
 
-        int128 userD0 = d0 / int16(multiplier);
-        int128 userD1 = d1 / int16(multiplier);
-
-        //We can assume that delta1 is also < 0
-        if (d0 < 0) {
-            poolManager.take(key.currency0, address(this), uint128(-d0));
-            poolManager.take(key.currency1, address(this), uint128(-d1));
-
-            aavePool.modifyLiquidity(ModifyLiquidityAave(address(this), a0, a1, deltas));
-
-            _settle(key.currency0, user, userD0);
-            _settle(key.currency1, user, userD1);
-
-            d0 = int128(TransientStateLibrary.currencyDelta(poolManager, address(this), key.currency0));
-            d1 = int128(TransientStateLibrary.currencyDelta(poolManager, address(this), key.currency1));
-
-            aavePool.borrow(a0, uint128(-d0));
-            _settle(key.currency0, address(this), d0);
-
-            aavePool.borrow(a1, uint128(-d1));
-            _settle(key.currency1, address(this), d1);
+        int128 userD0;
+        int128 userD1;
+        if (info.multiplier == 1) {
+            userD0 = d0;
+            userD1 = d1;
         } else {
-            uint256 debt0 = uint128(d0) - uint128(userD0);
-            uint256 debt1 = uint128(d1) - uint128(userD1);
-
-            poolManager.take(key.currency0, address(this), debt0);
-            poolManager.take(key.currency1, address(this), debt1);
-
-            aavePool.repay(a0, debt0, false);
-            aavePool.repay(a1, debt1, false);
-
-            aavePool.modifyLiquidity(ModifyLiquidityAave(address(this), a0, a1, deltas));
-
-            _settle(key.currency0, address(this), -int256(debt0));
-            _settle(key.currency1, address(this), -int256(debt1));
+            int16 m = int16(info.multiplier);
+            userD0 = d0 / m;
+            userD1 = d1 / m;
         }
 
+        if (d0 < 0 || d1 < 0) {
+            _borrowAndModify(c0, c1, a0, a1, d0, d1, userD0, userD1, deltas, info);
+        } else {
+            _repayAndModify(c0, c1, a0, a1, d0, d1, deltas, info);
+        }
         return data;
+    }
+
+    function _borrowAndModify(
+        Currency currency0,
+        Currency currency1,
+        address a0,
+        address a1,
+        int128 d0,
+        int128 d1,
+        int128 userD0,
+        int128 userD1,
+        BalanceDelta deltas,
+        PositionInfo storage info
+    ) internal {
+        // bring liquidity in
+        if (d0 < 0) poolManager.take(currency0, address(this), uint128(-d0));
+        if (d1 < 0) poolManager.take(currency1, address(this), uint128(-d1));
+
+        // deposit into Aave
+        aavePool.modifyLiquidity(ModifyLiquidityAave(address(this), a0, a1, deltas));
+
+        // settle user share
+        _settle(currency0, info.owner, userD0);
+        _settle(currency1, info.owner, userD1);
+
+        // recalc post-modification deltas
+        (d0, d1) = _currencyDeltas(currency0, currency1);
+
+        // borrow if necessary
+        if (d0 < 0) {
+            aavePool.borrow(a0, uint128(-d0));
+            _settle(currency0, address(this), d0);
+        }
+        if (d1 < 0) {
+            aavePool.borrow(a1, uint128(-d1));
+            _settle(currency1, address(this), d1);
+        }
+
+        info.debt = toBalanceDelta(d0, d1);
+    }
+
+    function _repayAndModify(
+        Currency currency0,
+        Currency currency1,
+        address a0,
+        address a1,
+        int128 d0,
+        int128 d1,
+        BalanceDelta deltas,
+        PositionInfo storage info
+    ) internal {
+        if (info.multiplier > 1) {
+            require(info.liquidity == 0);
+        }
+        // repay if there is debt
+        if (info.debt.amount0() < 0) {
+            poolManager.take(currency0, address(this), uint128(-info.debt.amount0()));
+            aavePool.repay(a0, uint128(-info.debt.amount0()), false);
+        }
+        if (info.debt.amount1() < 0) {
+            poolManager.take(currency1, address(this), uint128(-info.debt.amount1()));
+            aavePool.repay(a1, uint128(-info.debt.amount1()), false);
+        }
+
+        // modify liquidity on behalf of owner
+        aavePool.modifyLiquidity(ModifyLiquidityAave(address(this), a0, a1, deltas));
+
+        // recalc post-modification deltas
+        (d0, d1) = _currencyDeltas(currency0, currency1);
+
+        // settle remaining if still negative
+        if (d0 < 0) _settle(currency0, address(this), d0);
+        if (d1 < 0) _settle(currency1, address(this), d1);
+
+        // reset debt
+        info.debt = BalanceDelta.wrap(0);
+    }
+
+    function _currencyDeltas(Currency c0, Currency c1) private view returns (int128 d0, int128 d1) {
+        d0 = int128(TransientStateLibrary.currencyDelta(poolManager, address(this), c0));
+        d1 = int128(TransientStateLibrary.currencyDelta(poolManager, address(this), c1));
     }
 
     /// @notice Fallback to wrap ETH into WETH

@@ -10,7 +10,7 @@ import {DataTypes} from "@aave/src/contracts/protocol/libraries/types/DataTypes.
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 
 struct ModifyLiquidityAave {
-    address user;
+    address to;
     address asset0;
     address asset1;
     BalanceDelta delta;
@@ -41,38 +41,45 @@ struct PoolMetrics {
     uint256 healthFactor;
 }
 
+
+
 library AaveHelper {
     using AaveHelper for IPool;
 
     uint256 private constant DUST = 1_000;
 
-    function _supplyToAave(IPool pool, address asset, uint128 amount) private {
+    function supplyToAave(IPool pool, address asset, uint128 amount) internal {
         IERC20(asset).approve(address(pool), amount);
         pool.supply(asset, amount, address(this), 0);
     }
 
     function safeWithdraw(IPool pool, address asset, uint128 amount, address to) internal {
-        try pool.withdraw(asset, amount, to) {
-            _handleResidualDebt(pool, asset);
+        try pool.withdraw(asset, amount, address(this)) {
+            IERC20(asset).transfer(to, amount - _handleResidualDebt(pool, asset));
         } catch {
-            _handleFallbackWithdraw(pool, asset, to);
+            _handleFallbackWithdraw(pool, asset, to, amount);
         }
     }
 
-    function _handleResidualDebt(IPool pool, address asset) private {
+    function _handleResidualDebt(IPool pool, address asset) private returns (uint256 repaid) {
         uint256 debt = getVariableDebtBalance(pool, asset);
         if (debt < DUST && debt != 0) {
-            repay(pool, asset, 0, true);
+            repaid = repay(pool, asset, debt, true);
         }
     }
 
-    function _handleFallbackWithdraw(IPool pool, address asset, address to) private {
+    function _handleFallbackWithdraw(IPool pool, address asset, address to, uint256 amount) private {
         uint256 debt = getVariableDebtBalance(pool, asset);
+        uint256 aBalance = getATokenBalance(pool, asset);
         if (debt < DUST && debt != 0) {
-            repayWithATokens(pool, asset, 0, true);
+            if (amount < aBalance) {
+                amount -= repayWithATokens(pool, asset, debt, true);
+            } else {
+                repay(pool, asset, debt, true);
+            }
         }
 
-        pool.withdraw(asset, getATokenBalance(pool, asset), to);
+        pool.withdraw(asset, amount < aBalance ? amount : aBalance, to);
     }
 
     function modifyLiquidity(IPool pool, ModifyLiquidityAave memory params) internal {
@@ -80,12 +87,12 @@ library AaveHelper {
         int128 amount1 = params.delta.amount1();
 
         // Supply negative amounts (using helper)
-        if (amount0 < 0) _supplyToAave(pool, params.asset0, uint128(-amount0));
-        if (amount1 < 0) _supplyToAave(pool, params.asset1, uint128(-amount1));
+        if (amount0 < 0) supplyToAave(pool, params.asset0, uint128(-amount0));
+        if (amount1 < 0) supplyToAave(pool, params.asset1, uint128(-amount1));
 
         // Withdraw positive amounts (direct calls)
-        if (amount0 > 0) safeWithdraw(pool, params.asset0, uint128(amount0), params.user);
-        if (amount1 > 0) safeWithdraw(pool, params.asset1, uint128(amount1), params.user);
+        if (amount0 > 0) safeWithdraw(pool, params.asset0, uint128(amount0), params.to);
+        if (amount1 > 0) safeWithdraw(pool, params.asset1, uint128(amount1), params.to);
     }
 
     function swap(IPool pool, SwapParamsAave memory params) internal {
@@ -94,10 +101,10 @@ library AaveHelper {
         require(amount0 > 0 || amount1 > 0);
 
         if (amount0 > amount1) {
-            _supplyToAave(pool, params.asset0, uint128(amount0));
+            supplyToAave(pool, params.asset0, uint128(amount0));
             safeWithdraw(pool, params.asset1, uint128(-amount1), address(this));
         } else {
-            _supplyToAave(pool, params.asset1, uint128(amount1));
+            supplyToAave(pool, params.asset1, uint128(amount1));
             safeWithdraw(pool, params.asset0, uint128(-amount0), address(this));
         }
     }

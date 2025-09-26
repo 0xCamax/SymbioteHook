@@ -310,10 +310,10 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
         // Verify liquidity was removed
         assertGt(liquidityDelta.amount0(), 0, "Should return ETH");
 
-        WETH.withdraw(uint128(liquidityDelta.amount0()));
+        WETH.withdraw(WETH.balanceOf(address(this)));
 
         // Verify we got our ETH back
-        assertGt(testAccount.balance, ethBalanceBefore, "ETH balance should increase");
+        assertGt(testAccount.balance + WETH.balanceOf(address(this)), ethBalanceBefore, "ETH balance should increase");
 
         console2.log(" Liquidity removed successfully");
         console2.log(" ETH returned:", uint256(uint128(liquidityDelta.amount0())));
@@ -561,7 +561,7 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
         private
         returns (BalanceDelta liquidityDelta, BalanceDelta feesAccrued)
     {
-        (, liquidityDelta, feesAccrued) = hook.modifyLiquidity(key, params);
+        (, liquidityDelta, feesAccrued) = hook.modifyLiquidity{value: 1_000}(key, params);
     }
 
     function _swap(uint128 amountIn, bool zeroForOne) private {
