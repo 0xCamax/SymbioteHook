@@ -147,10 +147,12 @@ contract HookScript is Script, ArbitrumConstants {
         private
         returns (bytes32 positionId, BalanceDelta feesAccrued, int24 tickLower, int24 tickUpper)
     {
-        Window memory activeWindow = hook.getActiveWindow(poolKey.toId());
+        (, int24 tick,,) = POOL_MANAGER.getSlot0(poolKey.toId());
 
-        tickLower = activeWindow.tickLower - (poolKey.tickSpacing * 2);
-        tickUpper = activeWindow.tickUpper + (poolKey.tickSpacing * 2);
+        tick = tick - (tick % poolKey.tickSpacing);
+
+        tickLower = tick - (poolKey.tickSpacing * 2);
+        tickUpper = tick + (poolKey.tickSpacing * 2);
 
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmount0(
             tickLower.getSqrtPriceAtTick(), tickUpper.getSqrtPriceAtTick(), amount0
@@ -163,8 +165,10 @@ contract HookScript is Script, ArbitrumConstants {
             salt: bytes32(abi.encode(multiplier))
         });
 
+        (uint160 currentPrice,,,) = POOL_MANAGER.getSlot0(poolKey.toId());
+
         BalanceDelta amounts = LiquidityMath.getAmountsForLiquidity(
-            POOL_MANAGER, poolKey.toId(), Window(params.tickLower, params.tickUpper, int128(liquidity), false)
+            currentPrice, Window(params.tickLower, params.tickUpper, int128(liquidity), false)
         );
 
         uint256 ethAmount = uint128(amounts.amount0());

@@ -2,6 +2,8 @@
 pragma solidity ^0.8.0;
 
 import {IPool} from "@aave/src/contracts/interfaces/IPool.sol";
+import {IAaveOracle} from "@aave/src/contracts/interfaces/IAaveOracle.sol";
+import {IPoolAddressesProvider} from "@aave/src/contracts/interfaces/IPoolAddressesProvider.sol";
 import {ICreditDelegationToken} from "@aave/src/contracts/interfaces/ICreditDelegationToken.sol";
 import {IAToken} from "@aave/src/contracts/interfaces/IAToken.sol";
 import {IERC20} from "@oz/contracts/token/ERC20/IERC20.sol";
@@ -41,7 +43,24 @@ struct PoolMetrics {
     uint256 healthFactor;
 }
 
-
+struct ReserveConfigDecoded {
+    uint256 ltv;
+    uint256 liquidationThreshold;
+    uint256 liquidationBonus;
+    uint256 decimals;
+    bool isActive;
+    bool isFrozen;
+    bool borrowingEnabled;
+    bool isPaused;
+    bool isolationModeBorrowingEnabled;
+    bool siloedBorrowingEnabled;
+    bool flashloanEnabled;
+    uint256 reserveFactor;
+    uint256 borrowCap;
+    uint256 supplyCap;
+    uint256 liquidationProtocolFee;
+    uint256 debtCeiling;
+}
 
 library AaveHelper {
     using AaveHelper for IPool;
@@ -95,20 +114,6 @@ library AaveHelper {
         if (amount1 > 0) safeWithdraw(pool, params.asset1, uint128(amount1), params.to);
     }
 
-    function swap(IPool pool, SwapParamsAave memory params) internal {
-        int128 amount0 = params.delta.amount0();
-        int128 amount1 = params.delta.amount1();
-        require(amount0 > 0 || amount1 > 0);
-
-        if (amount0 > amount1) {
-            supplyToAave(pool, params.asset0, uint128(amount0));
-            safeWithdraw(pool, params.asset1, uint128(-amount1), address(this));
-        } else {
-            supplyToAave(pool, params.asset1, uint128(amount1));
-            safeWithdraw(pool, params.asset0, uint128(-amount0), address(this));
-        }
-    }
-
     function borrow(IPool pool, address asset, uint256 amount) internal {
         pool.setUserUseReserveAsCollateral(asset, true);
         pool.borrow(asset, amount, 2, 0, address(this));
@@ -129,6 +134,35 @@ library AaveHelper {
         returns (DataTypes.ReserveDataLegacy memory)
     {
         return pool.getReserveData(asset);
+    }
+
+    function getReserveConfiguration(IPool pool, address asset)
+        internal
+        view
+        returns (ReserveConfigDecoded memory cfg)
+    {
+        DataTypes.ReserveConfigurationMap memory m = pool.getConfiguration(asset);
+
+        uint256 data = m.data;
+
+        cfg.ltv = (data >> 0) & 0xFFFF; // bits 0-15
+        cfg.liquidationThreshold = (data >> 16) & 0xFFFF; // bits 16-31
+        cfg.liquidationBonus = (data >> 32) & 0xFFFF; // bits 32-47
+        cfg.decimals = (data >> 48) & 0xFF; // bits 48-55
+
+        cfg.isActive = ((data >> 56) & 1) != 0;
+        cfg.isFrozen = ((data >> 57) & 1) != 0;
+        cfg.borrowingEnabled = ((data >> 58) & 1) != 0;
+        cfg.isPaused = ((data >> 60) & 1) != 0;
+        cfg.isolationModeBorrowingEnabled = ((data >> 61) & 1) != 0;
+        cfg.siloedBorrowingEnabled = ((data >> 62) & 1) != 0;
+        cfg.flashloanEnabled = ((data >> 63) & 1) != 0;
+
+        cfg.reserveFactor = (data >> 64) & 0xFFFF; // bits 64-79
+        cfg.borrowCap = (data >> 80) & ((1 << 36) - 1); // bits 80-115
+        cfg.supplyCap = (data >> 116) & ((1 << 36) - 1); // bits 116-151
+        cfg.liquidationProtocolFee = (data >> 152) & 0xFFFF; // bits 152-167
+        cfg.debtCeiling = (data >> 212) & ((1 << 40) - 1); // bits 212-251
     }
 
     /**
@@ -185,5 +219,10 @@ library AaveHelper {
     function canUseAsCollateral(IPool pool, address asset) internal view returns (bool) {
         AssetData memory data = getAssetData(pool, asset);
         return data.aTokenAddress != address(0) && data.currentLiquidityRate > 0;
+    }
+
+    function getAssetsPrices(IPool pool, address[] memory assets) internal view returns (uint256[] memory) {
+        IAaveOracle oracle = IAaveOracle(pool.ADDRESSES_PROVIDER().getPriceOracle());
+        return oracle.getAssetsPrices(assets);
     }
 }

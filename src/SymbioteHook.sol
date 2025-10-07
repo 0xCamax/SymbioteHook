@@ -3,7 +3,6 @@ pragma solidity ^0.8.0;
 
 import "./contracts/BaseHook.sol";
 import "./contracts/JITPoolManager.sol";
-import {Test, console2} from "forge-std/Test.sol";
 
 contract SymbioteHook is BaseHook, JITPoolManager {
     constructor(address initialOwner, address _poolManager, address _aavePool)
@@ -49,7 +48,7 @@ contract SymbioteHook is BaseHook, JITPoolManager {
         */
 
         (, int24 tick,,) = StateLibrary.getSlot0(poolManager, key.toId());
-        (, Window memory next) = JITLib.getJITWindows(_getPool(key.toId()), key.tickSpacing, params.zeroForOne);
+        (, Window memory next) = JITLibrary.getWindows(_getPool(key.toId()), key.tickSpacing, params.zeroForOne);
 
         if (params.zeroForOne) {
             require(next.tickLower < tick, "Slippage");

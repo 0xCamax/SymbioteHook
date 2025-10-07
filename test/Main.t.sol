@@ -9,6 +9,7 @@ import "../src/SymbioteHook.sol";
 import {PoolMetrics} from "../src/libraries/AaveHelper.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {TickBitmap} from "@uniswap/v4-core/src/libraries/TickBitmap.sol";
 
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {HookMiner} from "@uniswap/v4-periphery/src/utils/HookMiner.sol";
@@ -47,7 +48,9 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
     int24 private constant TICK_SPACING = 50;
 
     // Default swap amount
-    uint128 private constant SWAP_AMOUNT = 1_000_000_000;
+    uint128 private constant SWAP_AMOUNT = 0.00001 ether;
+
+    Pool.State pool;
 
     /*//////////////////////////////////////////////////////////////
                             STATE VARIABLES
@@ -180,6 +183,256 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
     }
 
     /*//////////////////////////////////////////////////////////////
+                        ACCOUNTING TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_noGap_noOverlap() public poolInitialized {
+        (Slot0 slot0,,,) = hook.getPoolState(poolKey.toId());
+        Pool.initialize(pool, slot0.sqrtPriceX96(), slot0.lpFee());
+
+        int24 base = slot0.tick() / poolKey.tickSpacing;
+        if (slot0.tick() < 0 && slot0.tick() % poolKey.tickSpacing != 0) base -= 1;
+        int24 tick = base * poolKey.tickSpacing;
+
+        // Rango inmediato
+        int24 tickLower = tick - poolKey.tickSpacing;
+        int24 tickUpper = tick + poolKey.tickSpacing;
+
+        Pool.modifyLiquidity(
+            pool,
+            Pool.ModifyLiquidityParams(
+                address(this), tickLower, tickUpper, LIQUIDITY_TO_ADD, poolKey.tickSpacing, bytes32(0)
+            )
+        );
+        Pool.modifyLiquidity(
+            pool,
+            Pool.ModifyLiquidityParams(
+                address(this),
+                tickLower - poolKey.tickSpacing,
+                tickLower,
+                LIQUIDITY_TO_ADD,
+                poolKey.tickSpacing,
+                bytes32(0)
+            )
+        );
+
+        (Window memory active, Window memory next) = JITLibrary.getWindows(pool, poolKey.tickSpacing, true);
+
+        console2.log("pos.tickLower:", tickLower);
+        console2.log("pos.tickUpper:", tickUpper);
+        console2.log("pos2.tickLower:", tickLower - poolKey.tickSpacing);
+        console2.log("pos2.tickUpper:", tickLower);
+
+        console2.log("active.tickLower:", active.tickLower);
+        console2.log("active.tickUpper:", active.tickUpper);
+        console2.log("active.liquidity:", active.liquidity);
+        console2.log("next.tickLower:", next.tickLower);
+        console2.log("next.tickUpper:", next.tickUpper);
+        console2.log("next.liquidity:", next.liquidity);
+
+        assertEq(active.tickLower, tick, "active.tickLower incorrect");
+        assertEq(active.tickUpper, tickUpper, "active.tickUpper incorrect");
+        assertEq(active.liquidity, int128(pool.liquidity), "active.liquidity must match pool liquidity");
+
+        assertEq(next.liquidity, int128(pool.liquidity), "next.liquidity must be equal");
+    }
+
+    function test_gap_noOverlap() public poolInitialized {
+        (Slot0 slot0,,,) = hook.getPoolState(poolKey.toId());
+        Pool.initialize(pool, slot0.sqrtPriceX96(), slot0.lpFee());
+
+        int24 base = slot0.tick() / poolKey.tickSpacing;
+        if (slot0.tick() < 0 && slot0.tick() % poolKey.tickSpacing != 0) base -= 1;
+        int24 tick = base * poolKey.tickSpacing;
+
+        int24 gapLower = tick + poolKey.tickSpacing * 5;
+        int24 gapUpper = tick + poolKey.tickSpacing * 7;
+
+        Pool.modifyLiquidity(
+            pool,
+            Pool.ModifyLiquidityParams(
+                address(this), gapLower, gapUpper, LIQUIDITY_TO_ADD, poolKey.tickSpacing, bytes32(0)
+            )
+        );
+
+        (Window memory active, Window memory next) = JITLibrary.getWindows(pool, poolKey.tickSpacing, false);
+
+        console2.log("pos.tickLower:", gapLower);
+        console2.log("pos.tickUpper:", gapUpper);
+        console2.log("active.tickLower:", active.tickLower);
+        console2.log("active.tickUpper:", active.tickUpper);
+        console2.log("active.liquidity:", active.liquidity);
+        console2.log("next.tickLower:", next.tickLower);
+        console2.log("next.tickUpper:", next.tickUpper);
+        console2.log("next.liquidity:", next.liquidity);
+
+        // Active no debería contener liquidez (está lejos)
+        assertEq(active.liquidity, int128(pool.liquidity), "active.liquidity incorrect");
+
+        // Next debe reflejar la liquidez despues del gap
+        assertEq(next.tickLower, gapLower, "next.tickLower incorrect");
+        assertEq(next.tickUpper, gapLower + poolKey.tickSpacing, "next.tickUpper incorrect");
+        assertEq(next.liquidity, LIQUIDITY_TO_ADD, "next.liquidity incorrect");
+    }
+
+    function test_noGap_overlap() public poolInitialized {
+        (Slot0 slot0,,,) = hook.getPoolState(poolKey.toId());
+        Pool.initialize(pool, slot0.sqrtPriceX96(), slot0.lpFee());
+
+        int24 base = slot0.tick() / poolKey.tickSpacing;
+        if (slot0.tick() < 0 && slot0.tick() % poolKey.tickSpacing != 0) base -= 1;
+        int24 tick = base * poolKey.tickSpacing;
+
+        // Posición grande
+        Pool.modifyLiquidity(
+            pool,
+            Pool.ModifyLiquidityParams(
+                address(this),
+                tick - poolKey.tickSpacing * 3,
+                tick + poolKey.tickSpacing * 3,
+                LIQUIDITY_TO_ADD,
+                poolKey.tickSpacing,
+                bytes32(0)
+            )
+        );
+
+        // Posición solapada más pequeña
+        Pool.modifyLiquidity(
+            pool,
+            Pool.ModifyLiquidityParams(
+                address(this),
+                tick - poolKey.tickSpacing,
+                tick + poolKey.tickSpacing,
+                LIQUIDITY_TO_ADD * 2,
+                poolKey.tickSpacing,
+                bytes32(0)
+            )
+        );
+
+        (Window memory active, Window memory next) = JITLibrary.getWindows(pool, poolKey.tickSpacing, true);
+
+        // En solapamiento, la liquidez activa debe ser mayor a la suma inicial
+        assertTrue(active.liquidity > LIQUIDITY_TO_ADD, "active.liquidity must reflect overlap");
+        assertTrue(next.liquidity >= 0, "next.liquidity must be non-negative");
+    }
+
+    function test_gap_overlap() public poolInitialized {
+        (Slot0 slot0,,,) = hook.getPoolState(poolKey.toId());
+        Pool.initialize(pool, slot0.sqrtPriceX96(), slot0.lpFee());
+
+        int24 base = slot0.tick() / poolKey.tickSpacing;
+        if (slot0.tick() < 0 && slot0.tick() % poolKey.tickSpacing != 0) base -= 1;
+        int24 tick = base * poolKey.tickSpacing;
+
+        // Posición 1 (lejana)
+        int24 pos1Lower = tick + poolKey.tickSpacing * 5;
+        int24 pos1Upper = tick + poolKey.tickSpacing * 8;
+        Pool.modifyLiquidity(
+            pool,
+            Pool.ModifyLiquidityParams(
+                address(this), pos1Lower, pos1Upper, LIQUIDITY_TO_ADD, poolKey.tickSpacing, bytes32(0)
+            )
+        );
+
+        // Posición 2 (solapada)
+        int24 pos2Lower = tick + poolKey.tickSpacing * 5;
+        int24 pos2Upper = tick + poolKey.tickSpacing * 9;
+        Pool.modifyLiquidity(
+            pool,
+            Pool.ModifyLiquidityParams(
+                address(this), pos2Lower, pos2Upper, LIQUIDITY_TO_ADD * 2, poolKey.tickSpacing, bytes32(0)
+            )
+        );
+
+        (Window memory active, Window memory next) = JITLibrary.getWindows(pool, poolKey.tickSpacing, false);
+
+        console2.log("=== test_gap_overlap ===");
+        console2.log("pos1.tickLower:", pos1Lower);
+        console2.log("pos1.tickUpper:", pos1Upper);
+        console2.log("pos2.tickLower:", pos2Lower);
+        console2.log("pos2.tickUpper:", pos2Upper);
+        console2.log("active.tickLower:", active.tickLower);
+        console2.log("active.tickUpper:", active.tickUpper);
+        console2.log("active.liquidity:", active.liquidity);
+        console2.log("next.tickLower:", next.tickLower);
+        console2.log("next.tickUpper:", next.tickUpper);
+        console2.log("next.liquidity:", next.liquidity);
+
+        // Active está vacío porque las posiciones están lejos
+        assertEq(active.liquidity, int128(pool.liquidity), "active.liquidity incorrect");
+
+        // Next debe contener liquidez y detectar overlap
+        assertTrue(next.liquidity > LIQUIDITY_TO_ADD, "next.liquidity must reflect overlap");
+    }
+
+    function test_tickNegativeNormalization() public poolInitialized {
+        int24 fakeNegativeTick = -53;
+        int24 base = fakeNegativeTick / poolKey.tickSpacing;
+        if (fakeNegativeTick < 0 && fakeNegativeTick % poolKey.tickSpacing != 0) base -= 1;
+
+        int24 tickLower = base * poolKey.tickSpacing;
+        int24 tickUpper = tickLower + poolKey.tickSpacing;
+
+        // Si spacing=10 => tickLower = -60, tickUpper = -50
+        assertEq(tickLower % poolKey.tickSpacing, 0, "tickLower must align to spacing");
+        assertEq(tickUpper - tickLower, poolKey.tickSpacing, "tickUpper must be +spacing from tickLower");
+    }
+
+    function test_multipleOverlapsRecursive() public poolInitialized {
+        (Slot0 slot0,,,) = hook.getPoolState(poolKey.toId());
+        Pool.initialize(pool, slot0.sqrtPriceX96(), slot0.lpFee());
+
+        int24 base = slot0.tick() / poolKey.tickSpacing;
+        if (slot0.tick() < 0 && slot0.tick() % poolKey.tickSpacing != 0) base -= 1;
+        int24 tick = base * poolKey.tickSpacing;
+
+        // Posición 1 (grande)
+        Pool.modifyLiquidity(
+            pool,
+            Pool.ModifyLiquidityParams(
+                address(this),
+                tick - poolKey.tickSpacing * 5,
+                tick + poolKey.tickSpacing * 5,
+                LIQUIDITY_TO_ADD,
+                poolKey.tickSpacing,
+                bytes32(0)
+            )
+        );
+
+        // Posición 2 (mediana)
+        Pool.modifyLiquidity(
+            pool,
+            Pool.ModifyLiquidityParams(
+                address(this),
+                tick - poolKey.tickSpacing * 3,
+                tick + poolKey.tickSpacing * 3,
+                LIQUIDITY_TO_ADD * 2,
+                poolKey.tickSpacing,
+                bytes32(0)
+            )
+        );
+
+        // Posición 3 (pequeña)
+        Pool.modifyLiquidity(
+            pool,
+            Pool.ModifyLiquidityParams(
+                address(this),
+                tick - poolKey.tickSpacing,
+                tick + poolKey.tickSpacing,
+                LIQUIDITY_TO_ADD * 3,
+                poolKey.tickSpacing,
+                bytes32(0)
+            )
+        );
+
+        (Window memory active, Window memory next) = JITLibrary.getWindows(pool, poolKey.tickSpacing, true);
+
+        // La liquidez debe ser creciente con cada solapamiento
+        assertTrue(active.liquidity >= LIQUIDITY_TO_ADD * 3, "active.liquidity must include recursive overlaps");
+        assertTrue(next.liquidity >= 0, "next.liquidity must not be negative");
+    }
+
+    /*//////////////////////////////////////////////////////////////
                        LIQUIDITY MANAGEMENT TESTS
     //////////////////////////////////////////////////////////////*/
 
@@ -254,9 +507,11 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
 
         uint128 leveragedLiquidity = uint128(LIQUIDITY_TO_ADD) * 4;
 
+        (uint160 sqrtPrice,,,) = POOL_MANAGER.getSlot0(poolKey.toId());
+
         //  total required amounts for leveraged liquidity
         BalanceDelta amounts = LiquidityMath.getAmountsForLiquidity(
-            POOL_MANAGER, poolKey.toId(), Window(tickLower, tickUpper, int128(leveragedLiquidity), false)
+            sqrtPrice, Window(tickLower, tickUpper, int128(leveragedLiquidity), false)
         );
 
         uint256 required0 = uint128(amounts.amount0());
@@ -290,6 +545,8 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
     function test_AddRemoveLeverage_Success() public poolInitialized {
         // execute liquidity addition (returns tick range)
         (,, int24 tickLower, int24 tickUpper) = _addLiquidity(LIQUIDITY_TO_ADD, 4);
+
+        WETH.deposit{value: 1_000}();
 
         _removeLiquidity(
             poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(abi.encode(4)))
@@ -331,17 +588,15 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
         bytes[] memory params = new bytes[](3);
         Currency currency0 = Currency.wrap(address(0));
         Currency currency1 = Currency.wrap(address(USDC));
-        Window memory activeWindow = hook.getActiveWindow(poolKey.toId());
+        (, int24 tick,,) = POOL_MANAGER.getSlot0(poolKey.toId());
+
+        int24 tickLower = tick - (tick % poolKey.tickSpacing);
+
+        tickLower = tickLower - (poolKey.tickSpacing * 2);
+        int24 tickUpper = tickLower + (poolKey.tickSpacing * 2);
 
         params[0] = abi.encode(
-            poolKey,
-            activeWindow.tickLower,
-            activeWindow.tickUpper,
-            100_000_000_000,
-            type(uint256).max,
-            type(uint256).max,
-            address(this),
-            ""
+            poolKey, tickLower, tickUpper, 100_000_000_000, type(uint256).max, type(uint256).max, address(this), ""
         );
 
         params[1] = abi.encode(currency0, currency1);
@@ -377,9 +632,10 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
         (, uint256 fees0, uint256 fees1,) = hook.getPoolState(poolKey.toId());
 
         // Calculate expected amounts
+        (uint160 sqrtPrice,,,) = POOL_MANAGER.getSlot0(poolKey.toId());
 
         BalanceDelta amounts = LiquidityMath.getAmountsForLiquidity(
-            POOL_MANAGER, poolKey.toId(), Window(tickLower, tickUpper, LIQUIDITY_TO_ADD, false)
+            sqrtPrice, Window(tickLower, tickUpper, int128(LIQUIDITY_TO_ADD), false)
         );
 
         // Verify fees were generated
@@ -407,10 +663,14 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
         console2.log("USDC balance:", initialUSDC);
 
         // Add liquidity
-        (,, int24 tickLower, int24 tickUpper) = _addLiquidity(LIQUIDITY_TO_ADD, 1);
+        (,, int24 tickLower, int24 tickUpper) = _addLiquidity(LIQUIDITY_TO_ADD, 4);
 
-        uint256 afterAddETH = testAccount.balance;
+        uint256 afterAddETH = testAccount.balance + IERC20(address(WETH)).balanceOf(testAccount);
         uint256 afterAddUSDC = USDC.balanceOf(testAccount);
+
+
+        console2.log("Pos tickLower:", tickLower);
+        console2.log("Pos tickupper:", tickUpper);
 
         console2.log("=== AFTER ADD LIQUIDITY ===");
         console2.log("ETH balance:", afterAddETH);
@@ -428,23 +688,19 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
         // Perform alternating swaps
         for (uint8 i = 0; i < 100; i++) {
             if (i % 2 == 0) {
-                _swap(SWAP_AMOUNT * 10, true); // ETH -> USDC
+                _swap(SWAP_AMOUNT, true); // ETH -> USDC
             } else {
                 _swap(1_000_000, false); // USDC -> ETH
             }
         }
         vm.stopPrank();
 
-        console2.log("=== AFTER SWAPS ===");
-        PoolMetrics memory metricsAfterSwaps = hook.getPositionData();
-        _logPoolMetrics(metricsAfterSwaps);
-
         // Remove liquidity
-        (BalanceDelta liquidityDelta,) = _removeLiquidity(
-            poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(abi.encode(1)))
+        (BalanceDelta liquidityDelta, BalanceDelta fees) = _removeLiquidity(
+            poolKey, ModifyLiquidityParams(tickLower, tickUpper, -LIQUIDITY_TO_ADD, bytes32(abi.encode(4)))
         );
 
-        uint256 finalETH = testAccount.balance + IERC20(address(WETH)).balanceOf(address(this));
+        uint256 finalETH = testAccount.balance + IERC20(address(WETH)).balanceOf(testAccount);
         uint256 finalUSDC = USDC.balanceOf(testAccount);
 
         console2.log("=== FINAL STATE ===");
@@ -454,6 +710,8 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
         console2.log("Net USDC change:", int256(finalUSDC) - int256(initialUSDC));
         console2.log("Liquidity delta ETH:", liquidityDelta.amount0());
         console2.log("Liquidity delta USDC:", liquidityDelta.amount1());
+        console2.log("fees delta ETH:", fees.amount0());
+        console2.log("fees delta USDC:", fees.amount1());
 
         // Hook should not retain significant balances
         uint256 hookETHBalance = address(hook).balance + IERC20(address(WETH)).balanceOf(address(hook));
@@ -462,6 +720,12 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
         console2.log("=== HOOK BALANCES ===");
         console2.log("Hook ETH balance:", hookETHBalance);
         console2.log("Hook USDC balance:", hookUSDCBalance);
+        console2.log("Hook ETH balance:", aETH.balanceOf(address(hook)));
+        console2.log("Hook USDC balance:", aUSC.balanceOf(address(hook)));
+
+        console2.log("=== AFTER CYCLE ===");
+        PoolMetrics memory metricsAfterSwaps = hook.getPositionData();
+        _logPoolMetrics(metricsAfterSwaps);
 
         assertLt(hookETHBalance, 0.01 ether, "Hook ETH balance too high");
         assertLt(hookUSDCBalance, 1000, "Hook USDC balance too high");
@@ -524,8 +788,7 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
     }
 
     function _initializePool() private {
-        (, int24 baseTick,,) = POOL_MANAGER.getSlot0(basePoolKey.toId());
-        uint160 sqrtPrice = (baseTick - (baseTick % poolKey.tickSpacing)).getSqrtPriceAtTick();
+        (uint160 sqrtPrice,,,) = POOL_MANAGER.getSlot0(basePoolKey.toId());
         hook.initialize(poolKey, sqrtPrice);
     }
 
@@ -533,11 +796,15 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
         private
         returns (bytes32 positionId, BalanceDelta feesAccrued, int24 tickLower, int24 tickUpper)
     {
-        Window memory activeWindow = hook.getActiveWindow(poolKey.toId());
+        (Slot0 slot0,,,) = hook.getPoolState(poolKey.toId());
+        int24 tick = slot0.tick();
+        uint160 price = slot0.sqrtPriceX96();
+
+        tick = tick - (tick % poolKey.tickSpacing);
 
         int128 baseLiquidity = liquidity;
-        tickLower = activeWindow.tickLower - (poolKey.tickSpacing * 2);
-        tickUpper = activeWindow.tickUpper + (poolKey.tickSpacing * 2);
+        tickLower = tick - (poolKey.tickSpacing * 10);
+        tickUpper = tick + (poolKey.tickSpacing * 10);
 
         ModifyLiquidityParams memory params = ModifyLiquidityParams({
             tickLower: tickLower,
@@ -547,21 +814,24 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
         });
 
         BalanceDelta amounts = LiquidityMath.getAmountsForLiquidity(
-            POOL_MANAGER,
-            poolKey.toId(),
-            Window(params.tickLower, params.tickUpper, int128(params.liquidityDelta + 1), false)
+            price, Window(tickLower, tickUpper, int128(params.liquidityDelta * int16(multiplier)) + 1, false)
         );
+
         uint256 ethAmount = uint128(amounts.amount0());
-        require(ethAmount <= address(this).balance, "Insufficient ETH for liquidity");
+        require(ethAmount <= testAccount.balance, "Insufficient ETH for liquidity");
 
         (positionId,, feesAccrued) = hook.modifyLiquidity{value: ethAmount}(poolKey, params);
+
+        assertEq(
+            address(hook).balance + IERC20(address(WETH)).balanceOf(address(hook)), 0, "Hook balance greater than 0"
+        );
     }
 
     function _removeLiquidity(PoolKey memory key, ModifyLiquidityParams memory params)
         private
         returns (BalanceDelta liquidityDelta, BalanceDelta feesAccrued)
     {
-        (, liquidityDelta, feesAccrued) = hook.modifyLiquidity{value: 1_000}(key, params);
+        (, liquidityDelta, feesAccrued) = hook.modifyLiquidity(key, params);
     }
 
     function _swap(uint128 amountIn, bool zeroForOne) private {
@@ -599,9 +869,9 @@ contract SymbioteHookTests is Test, ArbitrumConstants {
 
     function _logPoolMetrics(PoolMetrics memory metrics) private pure {
         console2.log("--- Pool Metrics ---");
-        console2.log("Total collateral (ETH):", metrics.totalCollateral);
-        console2.log("Total debt (ETH):", metrics.totalDebt);
-        console2.log("Available borrows (ETH):", metrics.availableBorrows);
+        console2.log("Total collateral:", metrics.totalCollateral);
+        console2.log("Total debt:", metrics.totalDebt);
+        console2.log("Available borrows:", metrics.availableBorrows);
         console2.log("Liquidation threshold:", metrics.currentLiquidationThreshold);
         console2.log("LTV:", metrics.ltv);
         console2.log("Health factor:", metrics.healthFactor);

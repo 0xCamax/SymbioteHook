@@ -15,23 +15,10 @@ import {TransientStateLibrary} from "@uniswap/v4-core/src/libraries/TransientSta
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Position} from "@uniswap/v4-core/src/libraries/Position.sol";
 import {SafeCallback} from "@uniswap/v4-periphery/src/base/SafeCallback.sol";
-import {JITLib} from "../libraries/JITLib.sol";
+import {JITLibrary} from "../libraries/JITLibrary.sol";
+import {PositionInfoLibrary, PositionInfo} from "../libraries/PositionInfoLibrary.sol";
 
-/// @notice Stores basic information about a user’s position
-struct PositionInfo {
-    /// @notice Owner of the position
-    address owner;
-    /// @notice Lower tick boundary of the position
-    int24 tickLower;
-    /// @notice Upper tick boundary of the position
-    int24 tickUpper;
-    /// @notice The amount of liquidity in this position
-    uint128 liquidity;
-    /// @notice The multiplier of liquidity in this position
-    uint16 multiplier;
-    /// @notice Position debt
-    BalanceDelta debt;
-}
+
 
 /// @notice Represents a liquidity window within a tick range
 /// @dev Windows are used to manage concentrated liquidity across specific tick ranges
@@ -51,7 +38,7 @@ struct Window {
 /// @dev Uses SafeCallback to ensure safe re-entrancy during liquidity operations
 contract JITPoolManager is IJITPoolManager, SafeCallback {
     using Pool for Pool.State;
-    using JITLib for Pool.State;
+    using JITLibrary for Pool.State;
     using AaveHelper for IPool;
     using StateLibrary for IPoolManager;
 
@@ -67,9 +54,6 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
 
     /// @notice Stores information about positions
     mapping(PoolId => mapping(bytes32 => PositionInfo)) public positionInfo;
-
-    /// @notice Mapping from PoolId => tickSpacing for that pool
-    mapping(PoolId => int24) internal poolSpacing;
 
     /// @notice Authorization modifier for owner or contract itself
     modifier auth() {
@@ -94,44 +78,52 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         Pool.State storage pool = _getPool(id);
 
         // Compute the active window and its liquidity
-        (Window memory active, Window memory next) = pool.getJITWindows(key.tickSpacing, zeroForOne);
+        (Window memory active, Window memory next) = JITLibrary.getWindows(pool, key.tickSpacing, zeroForOne);
 
         // Track active liquidity for next JIT operation
         if (add) {
             _checkSlot0Sync(id);
-            JITLib.modify(poolManager, key, active);
-            JITLib.modify(poolManager, key, next);
+            JITLibrary.modify(poolManager, key, [active, next]);
         } else {
+            _syncPoolState(id);
             active.liquidity = -active.liquidity;
             next.liquidity = -next.liquidity;
-            JITLib.modify(poolManager, key, active);
-            JITLib.modify(poolManager, key, next);
-            _syncPoolState(id);
+            JITLibrary.modify(poolManager, key, [active, next]);
             _resolveJIT(key);
         }
+    }
+
+    /// @notice Ensures pool slot0 is synchronized with PoolManager
+    function _checkSlot0Sync(PoolId id) internal view {
+        Pool.State storage pool = _getPool(id);
+        Slot0 slot0 = pool.slot0;
+        (uint160 pmSqrtPrice, int24 pmTick,,) = poolManager.getSlot0(id);
+        (uint256 feeGrowth0, uint256 feeGrowth1) = poolManager.getFeeGrowthGlobals(id);
+        require(pool.feeGrowthGlobal0X128 == feeGrowth0 && pool.feeGrowthGlobal1X128 == feeGrowth1, "Sync");
+        require(slot0.sqrtPriceX96() == pmSqrtPrice && slot0.tick() == pmTick, "Sync");
+    }
+
+    /// @notice Synchronizes pool state with PoolManager data
+    function _syncPoolState(PoolId id) internal {
+        Pool.State storage pool = _getPool(id);
+
+        (uint160 sqrtPrice, int24 tick,, uint24 fee) = poolManager.getSlot0(id);
+        (uint256 feeGrowth0, uint256 feeGrowth1) = poolManager.getFeeGrowthGlobals(id);
+        pool.feeGrowthGlobal0X128 = feeGrowth0;
+        pool.feeGrowthGlobal1X128 = feeGrowth1;
+
+        if (pool.slot0.tick() != tick) {
+            pool.crossTick(tick, pool.feeGrowthGlobal0X128, pool.feeGrowthGlobal1X128);
+            pool.liquidity = poolManager.getLiquidity(id);
+        }
+
+        pool.slot0 = pool.slot0.setSqrtPriceX96(sqrtPrice).setTick(tick).setLpFee(fee);
     }
 
     /// @notice Retrieves current Aave pool metrics
     /// @return PoolMetrics including health factor, utilization, and other position data
     function getPositionData() public view returns (PoolMetrics memory) {
         return aavePool.getPoolMetrics();
-    }
-
-    /// @notice Ensures pool slot0 is synchronized with PoolManager
-    function _checkSlot0Sync(PoolId id) internal view {
-        Slot0 slot0 = _getPool(id).slot0;
-        (uint160 pmSqrtPrice, int24 pmTick,,) = poolManager.getSlot0(id);
-        require(slot0.sqrtPriceX96() == pmSqrtPrice && slot0.tick() == pmTick);
-    }
-
-    /// @notice Synchronizes pool state with PoolManager data
-    function _syncPoolState(PoolId id) internal {
-        Pool.State storage pool = _pools[id];
-        (uint160 sqrtPrice, int24 tick,, uint24 fee) = poolManager.getSlot0(id);
-        (uint256 feeGrowth0, uint256 feeGrowth1) = poolManager.getFeeGrowthGlobals(id);
-        pool.slot0 = _pools[id].slot0.setSqrtPriceX96(sqrtPrice).setTick(tick).setLpFee(fee);
-        pool.feeGrowthGlobal0X128 = feeGrowth0;
-        pool.feeGrowthGlobal1X128 = feeGrowth1;
     }
 
     /// @notice Initializes a new pool
@@ -144,44 +136,34 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         Pool.State storage pool = _getPool(id);
         tick = pool.initialize(sqrtPriceX96, lpFee);
         poolManager.initialize(key, sqrtPriceX96);
-        poolSpacing[id] = key.tickSpacing;
     }
 
     function modifyLiquidity(PoolKey memory key, ModifyLiquidityParams memory params)
         external
         payable
         auth
-        returns (bytes32 positionId, BalanceDelta principalDelta, BalanceDelta feesAccrued)
+        returns (bytes32 positionId, BalanceDelta callerDelta, BalanceDelta feesAccrued)
     {
         uint16 multiplier = uint16(uint256(params.salt));
         int128 totalLiquidity = int128(int256(params.liquidityDelta) * int256(uint256(multiplier)));
-        int24 nWindows = (params.tickUpper - params.tickLower) / key.tickSpacing;
-
-        int24 lower = params.tickLower;
-
-        for (int24 i = 0; i < nWindows; i++) {
-            params.tickLower = lower;
-            params.tickUpper = lower + key.tickSpacing;
-            params.liquidityDelta = totalLiquidity;
-
-            (BalanceDelta pd, BalanceDelta fa) = _modifyLiquidity(key, params);
-            principalDelta = principalDelta + pd;
-            feesAccrued = feesAccrued + fa;
-
-            lower += key.tickSpacing;
-        }
 
         positionId = Position.calculatePositionKey(msg.sender, params.tickLower, params.tickUpper, params.salt);
         PositionInfo storage info = positionInfo[key.toId()][positionId];
 
         info.owner = msg.sender;
+        info.asset0 = Currency.unwrap(key.currency0);
+        info.asset1 = Currency.unwrap(key.currency1);
         info.tickLower = params.tickLower;
         info.tickUpper = params.tickUpper;
-        info.liquidity = uint128(int128(info.liquidity) + int128(params.liquidityDelta));
+        info.liquidity = uint128(int128(info.liquidity) + int128(totalLiquidity));
         info.multiplier = multiplier;
 
-        _resolve(key, principalDelta + feesAccrued, positionId);
+        BalanceDelta principalDelta;
+        (principalDelta, feesAccrued) = _modifyLiquidity(key, params);
 
+        callerDelta = principalDelta + feesAccrued;
+
+        _resolve(key, callerDelta, positionId);
         _sweep(key);
 
         emit ModifyLiquidity(positionId, msg.sender, params.tickLower, params.tickUpper, totalLiquidity, params.salt);
@@ -190,13 +172,14 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
     /// @notice Modify liquidity in the pool
     function _modifyLiquidity(PoolKey memory key, ModifyLiquidityParams memory params)
         internal
-        returns (BalanceDelta principalDelta, BalanceDelta feesAccrued)
+        returns (BalanceDelta callerDelta, BalanceDelta feesAccrued)
     {
         PoolId id = key.toId();
         {
             Pool.State storage pool = _getPool(id);
             pool.checkPoolInitialized();
 
+            BalanceDelta principalDelta;
             (principalDelta, feesAccrued) = pool.modifyLiquidity(
                 Pool.ModifyLiquidityParams({
                     owner: msg.sender,
@@ -207,6 +190,9 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
                     salt: params.salt
                 })
             );
+
+            // fee delta and principal delta are both accrued to the caller
+            callerDelta = principalDelta + feesAccrued;
         }
     }
 
@@ -221,7 +207,7 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
 
         if (currency.isAddressZero()) {
             if (address(this).balance < _amount) {
-                require(WETH.balanceOf(address(this)) >= _amount);
+                require(WETH.balanceOf(address(this)) >= _amount, "IF");
                 WETH.withdraw(_amount);
             }
             poolManager.settle{value: _amount}();
@@ -243,7 +229,7 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
     function withdraw(address asset, uint128 amount) external auth {
         aavePool.safeWithdraw(asset, amount, msg.sender);
     }
-    
+
     /// @notice Borrows assets from Aave pool
     function borrow(address asset, uint256 amount) external auth {
         aavePool.borrow(asset, amount);
@@ -263,6 +249,9 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
     /// @notice Sweeps leftover tokens back to the caller
     function _sweep(PoolKey memory key) internal {
         (address t0, address t1,,) = _get(key, toBalanceDelta(0, 0));
+        if (address(this).balance > 0) {
+            WETH.deposit{value: address(this).balance}();
+        }
         uint256 b0 = IERC20(t0).balanceOf(address(this));
         if (b0 > 0) IERC20(t0).transfer(msg.sender, b0);
         uint256 b1 = IERC20(t1).balanceOf(address(this));
@@ -271,15 +260,14 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
 
     /// @notice Resolves JIT swap and liquidity interactions
     function _resolveJIT(PoolKey memory key) internal {
-        int128 d0 = int128(TransientStateLibrary.currencyDelta(poolManager, address(this), key.currency0));
-        int128 d1 = int128(TransientStateLibrary.currencyDelta(poolManager, address(this), key.currency1));
+        (int128 d0, int128 d1) = _currencyDeltas(key.currency0, key.currency1);
         address a0 = key.currency0.isAddressZero() ? address(WETH) : Currency.unwrap(key.currency0);
         address a1 = Currency.unwrap(key.currency1);
 
         if (d0 > 0) poolManager.take(key.currency0, address(this), uint128(d0));
         if (d1 > 0) poolManager.take(key.currency1, address(this), uint128(d1));
 
-        aavePool.swap(SwapParamsAave(a0, a1, toBalanceDelta(d0, d1)));
+        aavePool.modifyLiquidity(ModifyLiquidityAave(address(this), a0, a1, toBalanceDelta(-d0, -d1)));
 
         if (d0 < 0) _settle(key.currency0, address(this), d0);
         if (d1 < 0) _settle(key.currency1, address(this), d1);
@@ -307,17 +295,6 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         feeGrowthGlobal1X128 = pool.feeGrowthGlobal1X128;
     }
 
-    /// @notice Returns the currently active window for a pool
-    function getActiveWindow(PoolId id) external view returns (Window memory) {
-        return _getActiveWindow(id);
-    }
-
-    function _getActiveWindow(PoolId id) internal view returns (Window memory) {
-        Pool.State storage pool = _getPool(id);
-        int24 spacing = poolSpacing[id];
-        return pool.getActiveWindow(spacing);
-    }
-
     function _get(PoolKey memory key, BalanceDelta deltas)
         internal
         pure
@@ -340,19 +317,8 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         PositionInfo storage info = positionInfo[id][positionId];
         (address a0, address a1, int128 d0, int128 d1) = _get(key, deltas);
 
-        int128 userD0;
-        int128 userD1;
-        if (info.multiplier == 1) {
-            userD0 = d0;
-            userD1 = d1;
-        } else {
-            int16 m = int16(info.multiplier);
-            userD0 = d0 / m;
-            userD1 = d1 / m;
-        }
-
         if (d0 < 0 || d1 < 0) {
-            _borrowAndModify(c0, c1, a0, a1, d0, d1, userD0, userD1, deltas, info);
+            _borrowAndModify(c0, c1, a0, a1, d0, d1, deltas, info);
         } else {
             _repayAndModify(c0, c1, a0, a1, d0, d1, deltas, info);
         }
@@ -366,14 +332,23 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         address a1,
         int128 d0,
         int128 d1,
-        int128 userD0,
-        int128 userD1,
         BalanceDelta deltas,
         PositionInfo storage info
     ) internal {
         // bring liquidity in
         if (d0 < 0) poolManager.take(currency0, address(this), uint128(-d0));
         if (d1 < 0) poolManager.take(currency1, address(this), uint128(-d1));
+
+        int128 userD0;
+        int128 userD1;
+        if (info.multiplier == 1) {
+            userD0 = d0;
+            userD1 = d1;
+        } else {
+            int16 m = int16(info.multiplier);
+            userD0 = d0 / m;
+            userD1 = d1 / m;
+        }
 
         // deposit into Aave
         aavePool.modifyLiquidity(ModifyLiquidityAave(address(this), a0, a1, deltas));
@@ -408,16 +383,18 @@ contract JITPoolManager is IJITPoolManager, SafeCallback {
         BalanceDelta deltas,
         PositionInfo storage info
     ) internal {
+        uint256 DUST = 1_000;
         if (info.multiplier > 1) {
             require(info.liquidity == 0);
         }
+
         // repay if there is debt
-        if (info.debt.amount0() < 0) {
-            poolManager.take(currency0, address(this), uint128(-info.debt.amount0()));
+        if (info.debt.amount0() < 0 && info.multiplier > 1) {
+            poolManager.take(currency0, address(this), uint128(-info.debt.amount0()) + DUST);
             aavePool.repay(a0, uint128(-info.debt.amount0()), false);
         }
         if (info.debt.amount1() < 0) {
-            poolManager.take(currency1, address(this), uint128(-info.debt.amount1()));
+            poolManager.take(currency1, address(this), uint128(-info.debt.amount1()) + DUST);
             aavePool.repay(a1, uint128(-info.debt.amount1()), false);
         }
 
